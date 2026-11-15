@@ -28,11 +28,18 @@ static bool s_t0_set = false;
 static char s_step[40] = "pre-start";
 static int s_crash_fd = -1;
 
+/* CLOCK_REALTIME, not CLOCK_MONOTONIC: on firmware 14.0 the toolchain's
+ * monotonic clock ran about 20x slower than real time (a 16 MiB range
+ * journaled as 80 ms on a link that took 1.6 s to carry it), which made
+ * every journal timing meaningless. The wall clock matched the console's
+ * own clock in the crash journal. */
+#define DIAG_CLOCK CLOCK_REALTIME
+
 static double mono_sec(void)
 {
     struct timespec ts;
 
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(DIAG_CLOCK, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
@@ -53,7 +60,7 @@ void diag_note(const char* step)
 
     pthread_mutex_lock(&s_lock);
     if (!s_t0_set) {
-        clock_gettime(CLOCK_MONOTONIC, &s_t0);
+        clock_gettime(DIAG_CLOCK, &s_t0);
         s_t0_set = true;
         f = fopen(DIAG_BOOT_FILE, "w");
         if (f) {
@@ -111,6 +118,49 @@ void diag_hud(char* out, size_t outsz)
     }
     snprintf(out, outsz, "v%s  t=%3.0fs  %s", APP_VERSION, diag_uptime(),
              diag_step());
+}
+
+/* Heartbeat journal: one line every few seconds for the whole run, so a
+ * process the system kills outright (a CE error code, no fault handler)
+ * still leaves the minutes before the kill on disk. Rotates to .old at
+ * DIAG_BEAT_MAX_LINES so it never grows without bound (~2 h per file at
+ * one line per 5 s). Only the main loop writes it. */
+#define DIAG_BEAT_FILE     APP_WORK_DIR "/rpi_nextgen_beat.txt"
+#define DIAG_BEAT_OLD_FILE APP_WORK_DIR "/rpi_nextgen_beat.old.txt"
+#define DIAG_BEAT_MAX_LINES 1500
+
+static int s_beat_lines = -1; /* -1: not opened this run yet */
+
+void diag_beat(const char* line)
+{
+    FILE* f;
+    struct timespec now;
+    struct tm tm;
+
+    if (!line) {
+        return;
+    }
+    if (s_beat_lines < 0 || s_beat_lines >= DIAG_BEAT_MAX_LINES) {
+        if (s_beat_lines >= 0) {
+            rename(DIAG_BEAT_FILE, DIAG_BEAT_OLD_FILE);
+        }
+        f = fopen(DIAG_BEAT_FILE, "w");
+        if (!f) {
+            return;
+        }
+        fprintf(f, "%s v%s heartbeat\n", APP_SHORT_NAME, APP_VERSION);
+        fclose(f);
+        s_beat_lines = 0;
+    }
+
+    clock_gettime(CLOCK_REALTIME, &now);
+    gmtime_r(&now.tv_sec, &tm);
+    f = fopen(DIAG_BEAT_FILE, "a");
+    if (f) {
+        fprintf(f, "%02d:%02d:%02d %s\n", tm.tm_hour, tm.tm_min, tm.tm_sec, line);
+        fclose(f);
+        ++s_beat_lines;
+    }
 }
 
 int diag_crash_fd(void)

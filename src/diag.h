@@ -21,6 +21,10 @@ void diag_note(const char* step);
  * bound; returns without writing once the cap is reached. */
 void diag_notef(const char* fmt, ...);
 
+/* Appends one wall-clock-stamped line to /data/rpi_nextgen_beat.txt
+ * (rotated to .old.txt when full). Not capped: call it on a timer. */
+void diag_beat(const char* line);
+
 /* Last recorded step (for the crash journal and the HUD). */
 const char* diag_step(void);
 

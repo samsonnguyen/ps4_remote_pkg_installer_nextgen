@@ -1684,6 +1684,16 @@ bool server_is_running(void)
     return s_running;
 }
 
+int server_active_conns(void)
+{
+    int active;
+
+    pthread_mutex_lock(&s_lock);
+    active = s_active_conns;
+    pthread_mutex_unlock(&s_lock);
+    return active;
+}
+
 int server_port(void)
 {
     return s_port;

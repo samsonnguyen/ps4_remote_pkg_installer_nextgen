@@ -59,6 +59,9 @@ void proxy_abort_all(void);
  * (its workers joined), up to timeout_ms. Returns false on timeout. */
 bool proxy_wait_idle(int timeout_ms);
 
+/* Streams currently open (diagnostics). */
+int proxy_live_streams(void);
+
 /* Reads the next block of the stream (0 at EOF, -1 on error). */
 int64_t proxy_stream_read(void* stream, uint8_t* buf, size_t len);
 

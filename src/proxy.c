@@ -576,6 +576,16 @@ void proxy_abort_all(void)
     }
 }
 
+int proxy_live_streams(void)
+{
+    int n;
+
+    pthread_mutex_lock(&s_lock);
+    n = s_stream_count;
+    pthread_mutex_unlock(&s_lock);
+    return n;
+}
+
 bool proxy_wait_idle(int timeout_ms)
 {
     int waited = 0;
