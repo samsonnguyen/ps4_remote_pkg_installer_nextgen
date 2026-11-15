@@ -25,7 +25,7 @@
  * journal: __bin_chunk, then a garbage stdout FILE in locking_putc);
  * single-connection runs never did. Keep 1 until more workers are proven
  * stable; the engine still reads ahead across BGFT's requests. */
-#define PROXY_ENGINE_CONNS 1
+#define PROXY_ENGINE_CONNS 4 /* DEBUG: reproduce parallel load */
 
 /*
  * How BGFT reads a piece (journal, firmware 14.0): one 16 MiB Range request
