@@ -308,6 +308,7 @@ static void serve_proxy_piece(OrbisNetId fd, const char* method, int job_id,
     uint64_t len = 0;
     uint64_t sent = 0;
     bool is_head = strcmp(method, "HEAD") == 0;
+    const char* mode = "-";
     void* stream;
     char head[384];
     uint8_t* buf;
@@ -377,6 +378,7 @@ static void serve_proxy_piece(OrbisNetId fd, const char* method, int job_id,
         resp_error(fd, 503, "Service unavailable", "Piece stream unavailable");
         return;
     }
+    mode = proxy_stream_mode(stream); /* static string: valid after close */
     conn_send_str(fd, head);
 
     buf = (uint8_t*)malloc(SERVER_SEND_CHUNK);
@@ -393,8 +395,8 @@ static void serve_proxy_piece(OrbisNetId fd, const char* method, int job_id,
     free(buf);
     proxy_stream_close(job_id, stream);
 
-    proxy_diag("proxy-end-%d/%zu-at-%llu-sent-%llu-of-%llu-ret-%lld", job_id,
-               piece, (unsigned long long)start, (unsigned long long)sent,
+    proxy_diag("proxy-end-%d/%zu-%s-at-%llu-sent-%llu-of-%llu-ret-%lld", job_id,
+               piece, mode, (unsigned long long)start, (unsigned long long)sent,
                (unsigned long long)len, (long long)n);
     if (n < 0) {
         LOG_WARN("proxy: stream for job %d piece %zu failed mid-transfer",

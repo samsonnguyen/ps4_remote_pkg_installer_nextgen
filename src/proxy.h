@@ -45,6 +45,11 @@ bool proxy_piece_size(int job_id, size_t piece, uint64_t* size);
 void* proxy_stream_open(int job_id, size_t piece, uint64_t offset,
                         uint64_t length);
 
+/* How a stream is served, for diagnostics: "new" or "reuse" (the job's
+ * read-ahead engine), "parallel" (single connection while the engine is
+ * busy) or "direct" (origin without Range). A static string. */
+const char* proxy_stream_mode(const void* stream);
+
 /* Reads the next block of the stream (0 at EOF, -1 on error). */
 int64_t proxy_stream_read(void* stream, uint8_t* buf, size_t len);
 
