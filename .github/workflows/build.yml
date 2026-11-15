@@ -82,6 +82,11 @@ jobs:
       - name: Build
         run: make
 
+      - name: Symbol map (for crash journal addresses)
+        run: |
+          llvm-nm -n -C build/*.elf > build/symbols.txt
+          llvm-readelf -l build/*.elf > build/segments.txt
+
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
@@ -89,4 +94,7 @@ jobs:
           path: |
             *.pkg
             eboot.bin
+            build/*.elf
+            build/symbols.txt
+            build/segments.txt
           if-no-files-found: error
