@@ -470,7 +470,7 @@ int main(void)
     }
     diag_note("exit-modules-down");
 
-    dbglogger_stop();
+    log_sinks_close();
 
     exit_app();
     return 0; /* not reached */

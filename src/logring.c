@@ -12,6 +12,50 @@
 #include <stdio.h>
 #include <string.h>
 
+/*
+ * stdio is NOT thread-safe in this app. The OpenOrbis musl only turns on
+ * FILE locking (libc.threaded) inside its own pthread_create, but the app's
+ * threads come from libkernel's pthread_create, so stdout and every
+ * fopen'd FILE keep lock = -1 ("never lock"). Concurrent printf calls then
+ * race on stdout's buffer pointers and can run past its static buffer:
+ * the crash journal showed a garbage stdout FILE (locking_putc, address
+ * 0x21 = '!') and heap metadata failures (__bin_chunk) once several
+ * threads logged at once. Every write to the shared sinks (stdout and
+ * dbglogger's socket/file) goes through this one mutex.
+ */
+static pthread_mutex_t s_out_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool s_sinks_open = true;
+
+void log_emit(const char* level, const char* fmt, ...)
+{
+    char msg[512];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    pthread_mutex_lock(&s_out_lock);
+    if (s_sinks_open) {
+        printf("[%s] %s\n", level, msg);
+        dbglogger_log("[%s] %s\n", level, msg);
+    }
+    pthread_mutex_unlock(&s_out_lock);
+
+    log_ring_add(level, "%s", msg);
+}
+
+void log_sinks_close(void)
+{
+    pthread_mutex_lock(&s_out_lock);
+    if (s_sinks_open) {
+        s_sinks_open = false;
+        fflush(stdout);
+        dbglogger_stop();
+    }
+    pthread_mutex_unlock(&s_out_lock);
+}
+
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static char s_ring[LOG_RING_CAPACITY][LOG_RING_ENTRY_MAX];
 static int s_count = 0;   /* total entries kept (bounded by capacity) */
