@@ -13,6 +13,7 @@
 #include "bgft.h"
 #include "crash.h"
 #include "diag.h"
+#include "heapcheck.h"
 #include "http_client.h"
 #include "installer.h"
 #include "log.h"
@@ -116,7 +117,8 @@ static void heartbeat_tick(void)
     static time_t s_last = 0;
     time_t now = time(NULL);
     size_t flex = 0;
-    char line[512];
+    char heap[160];
+    char line[640];
     struct beat_jobs jobs;
     int n;
 
@@ -128,11 +130,13 @@ static void heartbeat_tick(void)
     if (sceKernelAvailableFlexibleMemorySize(&flex) != 0) {
         flex = 0;
     }
+    heapcheck_scan();
+    heapcheck_stats(heap, sizeof(heap));
     n = snprintf(line, sizeof(line),
-                 "up=%.0fs flex=%zuK eng=%d/%d ring=%zuK streams=%d conns=%d step=%s",
+                 "up=%.0fs flex=%zuK eng=%d/%d ring=%zuK streams=%d conns=%d %s step=%s",
                  diag_uptime(), flex >> 10, prefetch_live_count(),
                  prefetch_live_multi_count(), prefetch_ring_bytes() >> 10,
-                 proxy_live_streams(), server_active_conns(), diag_step());
+                 proxy_live_streams(), server_active_conns(), heap, diag_step());
     if (n < 0) {
         return;
     }

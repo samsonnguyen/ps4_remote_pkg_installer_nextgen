@@ -55,6 +55,15 @@ CFLAGS      := --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -c $(EXTRA
 LDFLAGS     := -m elf_x86_64 -pie --script $(TOOLCHAIN)/link.x --eh-frame-hdr \
                -L$(TOOLCHAIN)/lib $(LIBS) $(TOOLCHAIN)/lib/crt1.o
 
+# Debug heap checker (src/heapcheck.c): routes the allocator through guard,
+# quarantine and double-free checks. Findings: /data/rpi_nextgen_heap.txt.
+DEBUG_HEAP  ?= 1
+ifeq ($(DEBUG_HEAP),1)
+CFLAGS      += -DDEBUG_HEAP
+LDFLAGS     += --wrap=malloc --wrap=free --wrap=calloc --wrap=realloc \
+               --wrap=memalign
+endif
+
 # Create the intermediate directory in case it doesn't already exist.
 _unused     := $(shell mkdir -p $(INTDIR))
 
