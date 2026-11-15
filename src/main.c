@@ -29,6 +29,7 @@
 
 #include <orbis/Pad.h>
 #include <orbis/Sysmodule.h>
+#include <orbis/SystemService.h>
 #include <orbis/_types/pad.h>
 #include <orbis/_types/sysmodule.h>
 #include <orbis/UserService.h>
@@ -70,6 +71,33 @@ static bool s_safe_mode = false;
 
 /* Set at shutdown once every proxy transfer has been torn down. */
 static bool s_modules_safe_to_unload = true;
+
+/*
+ * Ends the app the way the system expects. Returning from main (or exit()/
+ * _exit()) ends in SIGSYS inside libkernel, which the console reports as a
+ * crash (CE-34878-0) after an otherwise clean shutdown. Apollo, Itemzflow
+ * and other homebrew ask the shell to close the app instead; the shell
+ * ends the process asynchronously, so wait for it.
+ */
+static void exit_app(void)
+{
+    int ret;
+    int waited;
+
+    diag_note("exit-loadexec");
+    ret = sceSystemServiceLoadExec("exit", NULL);
+    if (ret < 0) {
+        char note[64];
+        snprintf(note, sizeof(note), "exit-loadexec-ret-%08X", (unsigned)ret);
+        diag_note(note);
+        _exit(0);
+    }
+    for (waited = 0; waited < 100; ++waited) { /* 10 s */
+        usleep(100 * 1000);
+    }
+    diag_note("exit-loadexec-timeout");
+    _exit(0);
+}
 
 /* OPTIONS while a download is being served asks for a second press:
  * BGFT fetches proxied pieces from this app, so exiting stops them. */
@@ -405,12 +433,16 @@ int main(void)
      * SDL_DestroyRenderer frees every texture it created, and SDL_Quit()
      * tears the subsystem down entirely: freeing them afterwards (as the
      * old order did) is a use-after-free at exit. */
+    /* Each step is journaled so an exit fault names the step it died in. */
+    diag_note("exit-begin");
     server_stop();
+    diag_note("exit-server-stopped");
     /* Prefetch workers run inside libSceHttp/libSceNet: unloading those
      * modules (below) while a worker is still mid-request crashes the app
      * at exit. Wait for every engine to be joined; if one is still stuck,
      * leave the modules loaded and let process exit reclaim everything. */
     s_modules_safe_to_unload = proxy_wait_idle(8000);
+    diag_note(s_modules_safe_to_unload ? "exit-proxy-idle" : "exit-proxy-busy");
     if (s_ui_ok) {
         ui_fini();
     }
@@ -418,6 +450,7 @@ int main(void)
     bgft_fini();
     appinst_fini();
     netmon_stop();
+    diag_note("exit-services-stopped");
 
     if (s_ui_ok) {
         SDL_DestroyRenderer(s_renderer);
@@ -425,6 +458,7 @@ int main(void)
         SDL_Quit();
     }
     pad_fini();
+    diag_note("exit-sdl-pad-down");
 
     if (s_user_service_owned) {
         sceUserServiceTerminate();
@@ -434,8 +468,10 @@ int main(void)
     } else {
         LOG_WARN("exit: transfers still unwinding; leaving modules loaded");
     }
+    diag_note("exit-modules-down");
 
     dbglogger_stop();
 
-    return 0;
+    exit_app();
+    return 0; /* not reached */
 }
