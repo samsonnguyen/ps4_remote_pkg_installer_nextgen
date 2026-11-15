@@ -72,6 +72,23 @@ void diag_note(const char* step)
     }
 }
 
+#define DIAG_PROBE_MAX 96
+static int s_probe_count = 0;
+
+void diag_notef(const char* fmt, ...)
+{
+    char note[160];
+    va_list ap;
+
+    if (__atomic_fetch_add(&s_probe_count, 1, __ATOMIC_RELAXED) >= DIAG_PROBE_MAX) {
+        return;
+    }
+    va_start(ap, fmt);
+    vsnprintf(note, sizeof(note), fmt, ap);
+    va_end(ap);
+    diag_note(note);
+}
+
 const char* diag_step(void)
 {
     return s_step;

@@ -4,12 +4,131 @@
  * Licensed under the GNU General Public License v3.0. See LICENSE for details.
  */
 #include "prefetch.h"
+#include "diag.h"
 #include "http_client.h"
 #include "log.h"
 
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* musl exports it; the header only declares it under _GNU_SOURCE. */
+extern int pthread_getattr_np(pthread_t thread, pthread_attr_t* attr);
+
+/*
+ * Corruption probes. Two crashes on firmware 14.0 (__bin_chunk in free,
+ * then a garbage stdout FILE in locking_putc) appeared only while several
+ * multi-worker engines were alive. These probes record, in the boot
+ * journal, which of the candidates it is:
+ *  - a heap overrun: guard bytes after the ring, the chunk-state array and
+ *    every worker buffer, plus magic words around each engine struct;
+ *  - a stack overrun: each worker paints its stack and reports how deep
+ *    it went, next to the platform default stack size.
+ */
+#define PF_CANARY_LEN   64
+#define PF_CANARY_BYTE  0xA5
+#define PF_MAGIC_HEAD   0x50464845414430ULL /* "PFHEAD0" */
+#define PF_MAGIC_TAIL   0x50465441494C30ULL /* "PFTAIL0" */
+#define PF_STACK_PAINT  0x5AF00D5Au
+
+static void canary_set(uint8_t* p, size_t len)
+{
+    memset(p + len, PF_CANARY_BYTE, PF_CANARY_LEN);
+}
+
+static bool canary_ok(const uint8_t* p, size_t len)
+{
+    size_t i;
+    for (i = 0; i < PF_CANARY_LEN; ++i) {
+        if (p[len + i] != PF_CANARY_BYTE) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int s_canary_reports = 0;
+
+static void canary_report(const char* what, const void* pf, size_t extra)
+{
+    /* One journal line per kind of failure is enough to name it. */
+    if (__atomic_fetch_add(&s_canary_reports, 1, __ATOMIC_RELAXED) < 8) {
+        diag_notef("probe-corrupt-%s-pf-%p-x-%zu", what, pf, extra);
+        LOG_ERROR("prefetch: corruption detected: %s (engine %p, %zu)",
+                  what, pf, extra);
+    }
+}
+
+static size_t s_stack_hw_max = 0;
+
+/* Paints the unused part of this thread's stack; returns its lowest
+ * painted address (0 when the bounds are unknown). */
+static uintptr_t stack_paint(void)
+{
+    pthread_attr_t attr;
+    void* addr = NULL;
+    size_t size = 0;
+    volatile uint32_t* p;
+    uintptr_t lo;
+    uintptr_t sp = (uintptr_t)&attr;
+
+    if (pthread_getattr_np(pthread_self(), &attr) != 0) {
+        return 0;
+    }
+    pthread_attr_getstack(&attr, &addr, &size);
+    pthread_attr_destroy(&attr);
+    if (!addr || size < 64u * 1024u) {
+        return 0;
+    }
+    lo = ((uintptr_t)addr + 4096u + 3u) & ~(uintptr_t)3u; /* skip a page */
+    if (sp < lo + 8192u) {
+        return 0;
+    }
+    for (p = (volatile uint32_t*)lo; (uintptr_t)p < sp - 2048u; ++p) {
+        *p = PF_STACK_PAINT;
+    }
+    {
+        static int s_bounds_noted = 0;
+        if (__atomic_fetch_add(&s_bounds_noted, 1, __ATOMIC_RELAXED) == 0) {
+            pthread_attr_t def;
+            size_t def_size = 0;
+            pthread_attr_init(&def);
+            pthread_attr_getstacksize(&def, &def_size);
+            pthread_attr_destroy(&def);
+            diag_notef("probe-stack-worker-size-%zu-default-%zu", size, def_size);
+        }
+    }
+    return lo;
+}
+
+/* Reports the deepest stack use since stack_paint (new maxima only). */
+static void stack_report(uintptr_t lo)
+{
+    volatile uint32_t* p;
+    uintptr_t top;
+    pthread_attr_t attr;
+    void* addr = NULL;
+    size_t size = 0;
+    size_t used;
+    size_t prev;
+
+    if (!lo || pthread_getattr_np(pthread_self(), &attr) != 0) {
+        return;
+    }
+    pthread_attr_getstack(&attr, &addr, &size);
+    pthread_attr_destroy(&attr);
+    top = (uintptr_t)addr + size;
+    for (p = (volatile uint32_t*)lo; (uintptr_t)p < top && *p == PF_STACK_PAINT; ++p) {
+    }
+    used = top - (uintptr_t)p;
+    prev = __atomic_load_n(&s_stack_hw_max, __ATOMIC_RELAXED);
+    if (used > prev) {
+        __atomic_store_n(&s_stack_hw_max, used, __ATOMIC_RELAXED);
+        diag_notef("probe-stack-hw-%zu-of-%zu%s", used, size,
+                   ((uintptr_t)p <= lo) ? "-REACHED-GUARD" : "");
+    }
+}
 
 /*
  * Design: all workers pull from a SHARED sequential chunk frontier.
@@ -38,6 +157,7 @@ enum chunk_state {
 };
 
 struct prefetch {
+    uint64_t magic_head;         /* PF_MAGIC_HEAD while alive */
     char url[2048];
     uint64_t base;               /* origin offset of stream byte 0 */
     uint64_t total_size;         /* stream length from base */
@@ -61,7 +181,27 @@ struct prefetch {
     pthread_t threads[PREFETCH_MAX_CONNS];
     int thread_count;
     bool threads_spawned;
+    uint64_t magic_tail;         /* PF_MAGIC_TAIL while alive */
 };
+
+/* Checks the engine struct and its buffers; reports what is broken. */
+static bool pf_intact(const prefetch_t* pf, const char* where)
+{
+    bool ok = true;
+    if (pf->magic_head != PF_MAGIC_HEAD || pf->magic_tail != PF_MAGIC_TAIL) {
+        canary_report(where, pf, 1);
+        return false;
+    }
+    if (pf->ring && !canary_ok(pf->ring, pf->ring_size)) {
+        canary_report(where, pf, 2);
+        ok = false;
+    }
+    if (pf->chunk_state && !canary_ok(pf->chunk_state, pf->chunk_count)) {
+        canary_report(where, pf, 3);
+        ok = false;
+    }
+    return ok;
+}
 
 struct worker_ctx {
     prefetch_t* pf;
@@ -138,9 +278,14 @@ static void* worker_thread(void* arg)
 {
     struct worker_ctx* ctx = (struct worker_ctx*)arg;
     prefetch_t* pf = ctx->pf;
+    uintptr_t painted;
+    void* ret;
 
     free(ctx);
-    return worker_run(pf);
+    painted = stack_paint();
+    ret = worker_run(pf);
+    stack_report(painted);
+    return ret;
 }
 
 static void* worker_run(prefetch_t* pf)
@@ -148,7 +293,10 @@ static void* worker_run(prefetch_t* pf)
     http_session_t* sess = NULL;
     uint8_t* buf = NULL;
 
-    buf = (uint8_t*)malloc(PREFETCH_CHUNK_SIZE);
+    buf = (uint8_t*)malloc(PREFETCH_CHUNK_SIZE + PF_CANARY_LEN);
+    if (buf) {
+        canary_set(buf, PREFETCH_CHUNK_SIZE);
+    }
     if (!buf) {
         pthread_mutex_lock(&pf->lock);
         pf->read_failed = true;
@@ -164,6 +312,7 @@ static void* worker_run(prefetch_t* pf)
         http_result_t r = { 0 }; /* read in the failure log even when the
                                   * session could not be opened (r unfilled) */
         bool aborting;
+        bool fetched;
 
         /* Claim the next pending chunk inside the ring window. */
         pthread_mutex_lock(&pf->lock);
@@ -231,7 +380,12 @@ static void* worker_run(prefetch_t* pf)
 
         /* off is relative to the stream; the origin is asked at base + off,
          * while the ring keeps using the relative offset. */
-        if (!http_client_get_session(&sess, pf->url, pf->base + off, want, buf, want, &r) ||
+        fetched = http_client_get_session(&sess, pf->url, pf->base + off,
+                                          want, buf, want, &r);
+        if (!canary_ok(buf, PREFETCH_CHUNK_SIZE)) {
+            canary_report("workerbuf", pf, c);
+        }
+        if (!fetched ||
             !HTTP_IS_OK(r.status) || !r.partial || r.body_len != want) {
             pthread_mutex_lock(&pf->lock);
             if (pf->chunk_state[c] == CHUNK_CLAIMED) {
@@ -279,6 +433,7 @@ static void* worker_run(prefetch_t* pf)
                 }
             }
             aborting = pf->aborting;
+            pf_intact(pf, "after-ring-write");
             pthread_cond_broadcast(&pf->data_avail);
             pthread_cond_broadcast(&pf->work_avail);
         }
@@ -312,6 +467,8 @@ prefetch_t* prefetch_start(const char* url, uint64_t base, uint64_t total_size,
         return NULL;
     }
 
+    pf->magic_head = PF_MAGIC_HEAD;
+    pf->magic_tail = PF_MAGIC_TAIL;
     snprintf(pf->url, sizeof(pf->url), "%s", url);
     pf->base = base;
     pf->total_size = total_size;
@@ -325,12 +482,16 @@ prefetch_t* prefetch_start(const char* url, uint64_t base, uint64_t total_size,
     pthread_cond_init(&pf->data_avail, NULL);
     pthread_cond_init(&pf->work_avail, NULL);
 
-    pf->ring = (uint8_t*)malloc(pf->ring_size);
+    pf->ring = (uint8_t*)malloc(pf->ring_size + PF_CANARY_LEN);
     if (pf->ring) {
+        canary_set(pf->ring, pf->ring_size);
         ring_budget_add(pf->ring_size);
     }
     pf->chunk_count = (size_t)((total_size + PREFETCH_CHUNK_SIZE - 1) / PREFETCH_CHUNK_SIZE);
-    pf->chunk_state = (uint8_t*)calloc(pf->chunk_count, 1);
+    pf->chunk_state = (uint8_t*)calloc(pf->chunk_count + PF_CANARY_LEN, 1);
+    if (pf->chunk_state) {
+        canary_set(pf->chunk_state, pf->chunk_count);
+    }
     if (!pf->ring || !pf->chunk_state) {
         goto err;
     }
@@ -393,6 +554,11 @@ err:
 int64_t prefetch_read(prefetch_t* pf, uint8_t* buf, size_t len)
 {
     if (!pf || !buf || len == 0) {
+        return -1;
+    }
+    if (pf->magic_head != PF_MAGIC_HEAD || pf->magic_tail != PF_MAGIC_TAIL) {
+        /* Cleared by prefetch_free: a read through a stale engine pointer. */
+        canary_report("read-dead-engine", pf, len);
         return -1;
     }
 
@@ -475,6 +641,9 @@ void prefetch_free(prefetch_t* pf)
     for (i = 0; i < pf->thread_count; ++i) {
         pthread_join(pf->threads[i], NULL);
     }
+    pf_intact(pf, "free");
+    pf->magic_head = 0;
+    pf->magic_tail = 0;
     pthread_mutex_destroy(&pf->lock);
     pthread_cond_destroy(&pf->data_avail);
     pthread_cond_destroy(&pf->work_avail);

@@ -16,6 +16,11 @@
 /* Records a startup/runtime step. Persisted to /data/rpi_nextgen_boot.txt. */
 void diag_note(const char* step);
 
+/* printf-style diag_note for debug probes (canaries, stack depth, HTTP
+ * errors). Capped per run so a hot path cannot grow the journal without
+ * bound; returns without writing once the cap is reached. */
+void diag_notef(const char* fmt, ...);
+
 /* Last recorded step (for the crash journal and the HUD). */
 const char* diag_step(void);
 

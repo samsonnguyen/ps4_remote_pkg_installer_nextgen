@@ -20,6 +20,7 @@
  *   monitor calls it when the link drops).
  */
 #include "http_client.h"
+#include "diag.h"
 #include "log.h"
 #include "modules.h"
 #include "netmon.h"
@@ -35,6 +36,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Library failures also go to the boot journal (capped): if the HTTP pool
+ * runs dry under parallel workers, its out-of-memory codes show up there
+ * before any corruption does. */
+#define HTTP_ERR(name, v)                                                   \
+    do {                                                                    \
+        LOG_ERROR(name " failed: 0x%08X", (unsigned)(v));                   \
+        diag_notef("probe-http-%s-%08X", name, (unsigned)(v));              \
+    } while (0)
 
 #define HTTP_CLIENT_HEAP_SIZE (1 * 1024 * 1024)
 #define SSL_HEAP_SIZE (128 * 1024)
@@ -82,14 +92,14 @@ static bool ensure_init_locked(void)
 
     ret = sceSslInit(SSL_HEAP_SIZE);
     if (ret < 0) {
-        LOG_ERROR("sceSslInit failed: 0x%08X", ret);
+        HTTP_ERR("sceSslInit", ret);
         return false;
     }
     s_ssl_ctx = ret;
 
     ret = sceHttpInit(netmon_mem_id(), s_ssl_ctx, HTTP_CLIENT_HEAP_SIZE);
     if (ret < 0) {
-        LOG_ERROR("sceHttpInit failed: 0x%08X", ret);
+        HTTP_ERR("sceHttpInit", ret);
         sceSslTerm();
         s_ssl_ctx = -1;
         return false;
@@ -138,7 +148,7 @@ static int create_template(void)
     tpl = sceHttpCreateTemplate(s_http_ctx, APP_SHORT_NAME "/" APP_VERSION,
                                 ORBIS_HTTP_VERSION_1_1, 1 /* auto redirect */);
     if (tpl < 0) {
-        LOG_ERROR("sceHttpCreateTemplate failed: 0x%08X", tpl);
+        HTTP_ERR("sceHttpCreateTemplate", tpl);
         return -1;
     }
 
@@ -241,34 +251,34 @@ static bool request_with(int tpl, int conn, const char* url, const char* range_v
     do {
         req = sceHttpCreateRequestWithURL2(conn, "GET", url, (uint64_t)0);
         if (req < 0) {
-            LOG_ERROR("sceHttpCreateRequestWithURL2 failed: 0x%08X", req);
+            HTTP_ERR("sceHttpCreateRequestWithURL2", req);
             break;
         }
 
         ret = sceHttpAddRequestHeader(req, "Accept-Encoding", "identity",
                                       HTTP_HEADER_OVERWRITE);
         if (ret != 0) {
-            LOG_ERROR("sceHttpAddRequestHeader failed: 0x%08X", ret);
+            HTTP_ERR("sceHttpAddRequestHeader", ret);
             break;
         }
         if (range_value) {
             ret = sceHttpAddRequestHeader(req, "Range", range_value,
                                           HTTP_HEADER_OVERWRITE);
             if (ret != 0) {
-                LOG_ERROR("sceHttpAddRequestHeader(Range) failed: 0x%08X", ret);
+                HTTP_ERR("sceHttpAddRequestHeader(Range)", ret);
                 break;
             }
         }
 
         ret = sceHttpSendRequest(req, NULL, 0);
         if (ret < 0) {
-            LOG_ERROR("sceHttpSendRequest failed: 0x%08X", ret);
+            HTTP_ERR("sceHttpSendRequest", ret);
             break;
         }
 
         ret = sceHttpGetStatusCode(req, &result->status);
         if (ret < 0) {
-            LOG_ERROR("sceHttpGetStatusCode failed: 0x%08X", ret);
+            HTTP_ERR("sceHttpGetStatusCode", ret);
             break;
         }
 
@@ -302,7 +312,7 @@ static bool request_with(int tpl, int conn, const char* url, const char* range_v
                 size_t want = HTTP_CHUNK_SIZE;
                 int n = sceHttpReadData(req, chunk, want);
                 if (n < 0) {
-                    LOG_ERROR("sceHttpReadData failed: 0x%08X", n);
+                    HTTP_ERR("sceHttpReadData", n);
                     break;
                 }
                 if (n == 0) {
@@ -361,7 +371,7 @@ static bool do_request(const char* url, const char* range_value,
     if (tpl >= 0) {
         conn = sceHttpCreateConnectionWithURL(tpl, url, 1 /* keepalive */);
         if (conn < 0) {
-            LOG_ERROR("sceHttpCreateConnectionWithURL failed: 0x%08X", conn);
+            HTTP_ERR("sceHttpCreateConnectionWithURL", conn);
         }
     }
     if (tpl >= 0 && conn >= 0) {
@@ -410,7 +420,7 @@ http_session_t* http_session_open(const char* url)
     }
     s->conn = sceHttpCreateConnectionWithURL(s->tpl, url, 1 /* keepalive */);
     if (s->conn < 0) {
-        LOG_ERROR("sceHttpCreateConnectionWithURL failed: 0x%08X", s->conn);
+        HTTP_ERR("sceHttpCreateConnectionWithURL", s->conn);
         goto err;
     }
     return s;
@@ -483,23 +493,23 @@ http_stream_t* http_stream_open(const char* url)
     }
     s->conn = sceHttpCreateConnectionWithURL(s->tpl, url, 0);
     if (s->conn < 0) {
-        LOG_ERROR("sceHttpCreateConnectionWithURL failed: 0x%08X", s->conn);
+        HTTP_ERR("sceHttpCreateConnectionWithURL", s->conn);
         goto err;
     }
     s->req = sceHttpCreateRequestWithURL2(s->conn, "GET", url, (uint64_t)0);
     if (s->req < 0) {
-        LOG_ERROR("sceHttpCreateRequestWithURL2 failed: 0x%08X", s->req);
+        HTTP_ERR("sceHttpCreateRequestWithURL2", s->req);
         goto err;
     }
     ret = sceHttpAddRequestHeader(s->req, "Accept-Encoding", "identity",
                                   HTTP_HEADER_OVERWRITE);
     if (ret != 0) {
-        LOG_ERROR("sceHttpAddRequestHeader failed: 0x%08X", ret);
+        HTTP_ERR("sceHttpAddRequestHeader", ret);
         goto err;
     }
     ret = sceHttpSendRequest(s->req, NULL, 0);
     if (ret < 0) {
-        LOG_ERROR("sceHttpSendRequest failed: 0x%08X", ret);
+        HTTP_ERR("sceHttpSendRequest", ret);
         goto err;
     }
     ret = sceHttpGetStatusCode(s->req, &status);
