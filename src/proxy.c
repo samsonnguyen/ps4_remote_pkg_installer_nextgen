@@ -316,11 +316,20 @@ void* proxy_stream_open(int job_id, size_t piece, uint64_t offset,
             job->stream = NULL;
             job->stream_piece = -1;
         }
-        if (ranges_ok && length > 0 && offset < size &&
-            length <= size - offset && !job->engine_busy) {
+        bool valid = length > 0 && offset < size && length <= size - offset;
+        bool at_frontier = valid && job->engine && job->engine_piece == piece &&
+                           job->engine_pos == offset;
+        /* BGFT also opens an open-ended range in the middle of the piece
+         * ("bytes=12704-") and keeps that connection open for the whole
+         * download without reading it to the end. Lending the engine to
+         * it starved every real range request (journal: all "parallel",
+         * no speedup). Only bounded ranges, whole-piece requests and
+         * requests continuing at the engine's frontier get the engine. */
+        bool engine_worthy = at_frontier || (valid && offset + length < size) ||
+                             (offset == 0 && length == size);
+        if (ranges_ok && valid && engine_worthy && !job->engine_busy) {
             use_engine = true;
-            if (job->engine && job->engine_piece == piece &&
-                job->engine_pos == offset) {
+            if (at_frontier) {
                 reuse = true;
                 st->pf = job->engine; /* lent to this stream from now on */
             } else {
