@@ -349,7 +349,13 @@ void* proxy_stream_open(int job_id, size_t piece, uint64_t offset,
     }
     pthread_mutex_unlock(&s_lock);
 
-    engine_free_async(stale_engine);
+    /* Stop the old engine completely (workers joined) before starting its
+     * replacement: two multi-connection engines alive at once is the one
+     * condition every crash on firmware 14.0 had in common. The join waits
+     * at most for one in-flight 2 MiB fetch. */
+    if (stale_engine) {
+        prefetch_free(stale_engine);
+    }
 
     if (size == 0 || url[0] == '\0' || length == 0 || offset >= size ||
         length > size - offset) {
@@ -373,8 +379,12 @@ void* proxy_stream_open(int job_id, size_t piece, uint64_t offset,
         } else {
             /* The engine reads from `offset` to the end of the piece so the
              * next contiguous request finds it already running. */
-            int conns = (size - offset >= PROXY_BIG_PIECE) ? PROXY_ENGINE_CONNS
-                                                           : PROXY_CONN_SMALL;
+            /* Only one multi-connection engine may exist at a time, across
+             * every download; any other engine reads with one connection. */
+            int conns = (size - offset >= PROXY_BIG_PIECE &&
+                         prefetch_live_multi_count() == 0)
+                            ? PROXY_ENGINE_CONNS
+                            : PROXY_CONN_SMALL;
             prefetch_t* pf = prefetch_start(url, offset, size - offset, conns);
 
             pthread_mutex_lock(&s_lock);
@@ -391,7 +401,7 @@ void* proxy_stream_open(int job_id, size_t piece, uint64_t offset,
             if (pf && !st->pf) {
                 engine_free_async(pf); /* job vanished meanwhile */
             }
-            st->mode = "new";
+            st->mode = (conns > 1) ? "new-multi" : "new-single";
         }
         if (!st->pf) {
             /* Engine could not start; the claim was released above. */
