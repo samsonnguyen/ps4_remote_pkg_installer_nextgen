@@ -13,9 +13,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* musl exports it; the header only declares it under _GNU_SOURCE. */
-extern int pthread_getattr_np(pthread_t thread, pthread_attr_t* attr);
-
 /*
  * Corruption probes. Two crashes on firmware 14.0 (__bin_chunk in free,
  * then a garbage stdout FILE in locking_putc) appeared only while several
@@ -23,14 +20,13 @@ extern int pthread_getattr_np(pthread_t thread, pthread_attr_t* attr);
  * journal, which of the candidates it is:
  *  - a heap overrun: guard bytes after the ring, the chunk-state array and
  *    every worker buffer, plus magic words around each engine struct;
- *  - a stack overrun: each worker paints its stack and reports how deep
- *    it went, next to the platform default stack size.
+ *  (A stack-depth probe was removed: it called pthread_getattr_np, which
+ *  on this platform is libkernel's and faulted on an uninitialized attr.)
  */
 #define PF_CANARY_LEN   64
 #define PF_CANARY_BYTE  0xA5
 #define PF_MAGIC_HEAD   0x50464845414430ULL /* "PFHEAD0" */
 #define PF_MAGIC_TAIL   0x50465441494C30ULL /* "PFTAIL0" */
-#define PF_STACK_PAINT  0x5AF00D5Au
 
 static void canary_set(uint8_t* p, size_t len)
 {
@@ -60,75 +56,6 @@ static void canary_report(const char* what, const void* pf, size_t extra)
     }
 }
 
-static size_t s_stack_hw_max = 0;
-
-/* Paints the unused part of this thread's stack; returns its lowest
- * painted address (0 when the bounds are unknown). */
-static uintptr_t stack_paint(void)
-{
-    pthread_attr_t attr;
-    void* addr = NULL;
-    size_t size = 0;
-    volatile uint32_t* p;
-    uintptr_t lo;
-    uintptr_t sp = (uintptr_t)&attr;
-
-    if (pthread_getattr_np(pthread_self(), &attr) != 0) {
-        return 0;
-    }
-    pthread_attr_getstack(&attr, &addr, &size);
-    pthread_attr_destroy(&attr);
-    if (!addr || size < 64u * 1024u) {
-        return 0;
-    }
-    lo = ((uintptr_t)addr + 4096u + 3u) & ~(uintptr_t)3u; /* skip a page */
-    if (sp < lo + 8192u) {
-        return 0;
-    }
-    for (p = (volatile uint32_t*)lo; (uintptr_t)p < sp - 2048u; ++p) {
-        *p = PF_STACK_PAINT;
-    }
-    {
-        static int s_bounds_noted = 0;
-        if (__atomic_fetch_add(&s_bounds_noted, 1, __ATOMIC_RELAXED) == 0) {
-            pthread_attr_t def;
-            size_t def_size = 0;
-            pthread_attr_init(&def);
-            pthread_attr_getstacksize(&def, &def_size);
-            pthread_attr_destroy(&def);
-            diag_notef("probe-stack-worker-size-%zu-default-%zu", size, def_size);
-        }
-    }
-    return lo;
-}
-
-/* Reports the deepest stack use since stack_paint (new maxima only). */
-static void stack_report(uintptr_t lo)
-{
-    volatile uint32_t* p;
-    uintptr_t top;
-    pthread_attr_t attr;
-    void* addr = NULL;
-    size_t size = 0;
-    size_t used;
-    size_t prev;
-
-    if (!lo || pthread_getattr_np(pthread_self(), &attr) != 0) {
-        return;
-    }
-    pthread_attr_getstack(&attr, &addr, &size);
-    pthread_attr_destroy(&attr);
-    top = (uintptr_t)addr + size;
-    for (p = (volatile uint32_t*)lo; (uintptr_t)p < top && *p == PF_STACK_PAINT; ++p) {
-    }
-    used = top - (uintptr_t)p;
-    prev = __atomic_load_n(&s_stack_hw_max, __ATOMIC_RELAXED);
-    if (used > prev) {
-        __atomic_store_n(&s_stack_hw_max, used, __ATOMIC_RELAXED);
-        diag_notef("probe-stack-hw-%zu-of-%zu%s", used, size,
-                   ((uintptr_t)p <= lo) ? "-REACHED-GUARD" : "");
-    }
-}
 
 /*
  * Design: all workers pull from a SHARED sequential chunk frontier.
@@ -284,14 +211,9 @@ static void* worker_thread(void* arg)
 {
     struct worker_ctx* ctx = (struct worker_ctx*)arg;
     prefetch_t* pf = ctx->pf;
-    uintptr_t painted;
-    void* ret;
 
     free(ctx);
-    painted = stack_paint();
-    ret = worker_run(pf);
-    stack_report(painted);
-    return ret;
+    return worker_run(pf);
 }
 
 static void* worker_run(prefetch_t* pf)
