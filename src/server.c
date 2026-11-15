@@ -6,6 +6,7 @@
 #include "server.h"
 #include "appinst.h"
 #include "bgft.h"
+#include "diag.h"
 #include "http_client.h"
 #include "installer.h"
 #include "log.h"
@@ -1115,10 +1116,41 @@ static void route(OrbisNetId fd, const char* method, const char* path,
 
 struct http_request {
     char method[8];
-    char path[1024];
+    char path[1024];   /* without the query string */
+    char query[256];   /* text after '?', empty when absent (diagnostics) */
+    char range[96];    /* Range header value, empty when absent (diagnostics) */
     char* body;
     size_t body_len;
 };
+
+/* Copies the value of header `name` (e.g. "Range:") into out, trimmed. */
+static void find_header(const char* start, const char* end, const char* name,
+                        char* out, size_t outsz)
+{
+    size_t name_len = strlen(name);
+    const char* p = start;
+
+    out[0] = '\0';
+    while (p && p < end) {
+        if (strncasecmp(p, name, name_len) == 0) {
+            const char* v = p + name_len;
+            size_t n = 0;
+            while (*v == ' ' || *v == '\t') {
+                ++v;
+            }
+            while (v[n] && v[n] != '\r' && v[n] != '\n' && n + 1 < outsz) {
+                ++n;
+            }
+            memcpy(out, v, n);
+            out[n] = '\0';
+            return;
+        }
+        p = strchr(p, '\n');
+        if (p) {
+            ++p;
+        }
+    }
+}
 
 static bool conn_read_request(OrbisNetId fd, struct http_request* req)
 {
@@ -1180,9 +1212,27 @@ static bool conn_read_request(OrbisNetId fd, struct http_request* req)
                 return false;
             }
             snprintf(req->path, sizeof(req->path), "%s", sp1 + 1);
+
+            /* Route on the path alone. BGFT can append a query string to
+             * piece URLs, which used to turn /static/proxy/<job>/<piece>
+             * into a 400 (seen as task error 0x80991400). */
+            req->query[0] = '\0';
+            {
+                char* q = strchr(req->path, '?');
+                char* frag = strchr(req->path, '#');
+                if (frag) {
+                    *frag = '\0';
+                }
+                if (q) {
+                    snprintf(req->query, sizeof(req->query), "%s", q + 1);
+                    *q = '\0';
+                }
+            }
         }
         /* restore for body handling below (not needed, header_end is set) */
     }
+
+    find_header(headers_start, header_end, "Range:", req->range, sizeof(req->range));
 
     /* Content-Length + body. */
     req->body = NULL;
@@ -1250,6 +1300,17 @@ static void* conn_thread(void* arg)
     struct http_request req;
 
     if (conn_read_request(fd, &req)) {
+        /* Log what BGFT asks for: these requests are the download itself. */
+        if (util_starts_with(req.path, "/static/")) {
+            LOG_INFO("http: %s %s%s%s range=%s", req.method, req.path,
+                     req.query[0] ? "?" : "", req.query,
+                     req.range[0] ? req.range : "-");
+            if (req.query[0]) {
+                char note[96];
+                snprintf(note, sizeof(note), "http-static-query-%.60s", req.query);
+                diag_note(note);
+            }
+        }
         route(fd, req.method, req.path, req.body, req.body_len);
         free(req.body);
     } else {
