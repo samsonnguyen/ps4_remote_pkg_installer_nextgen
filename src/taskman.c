@@ -23,6 +23,9 @@ struct taskman_slot {
     uint64_t last_poll_transferred;
     uint64_t last_poll_tick_ms;
     bool last_progress_ok;
+    /* Completed by progress while BGFT still lists the task: its manifest
+     * and icon are removed once BGFT drops it from the queue. */
+    bool cleanup_pending;
 };
 
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -111,6 +114,16 @@ static void poll_task(struct taskman_slot* slot)
     }
 
     if (!bgft_get_progress(t->bgft_task_id, &progress, &error)) {
+        if (t->state == TASK_STATE_COMPLETED) {
+            if (slot->cleanup_pending) {
+                task_cleanup_files(t);
+                slot->cleanup_pending = false;
+                LOG_INFO("task #%d (bgft %d) left the queue after completing",
+                         t->id, t->bgft_task_id);
+            }
+            slot->last_progress_ok = false;
+            return;
+        }
         if (slot->last_progress_ok &&
             (t->state == TASK_STATE_RUNNING || t->state == TASK_STATE_REGISTERED ||
              t->state == TASK_STATE_PAUSED)) {
@@ -132,6 +145,9 @@ static void poll_task(struct taskman_slot* slot)
         return;
     }
     slot->last_progress_ok = true;
+    if (t->state == TASK_STATE_COMPLETED) {
+        return; /* only waiting for BGFT to drop it (cleanup above) */
+    }
 
     t->bits = progress.bits;
     t->error_result = progress.errorResult;
@@ -170,6 +186,21 @@ static void poll_task(struct taskman_slot* slot)
     }
 
     slot_refresh_derived(slot);
+
+    /* On firmware 14.0 a finished task stays in BGFT's queue (the game is
+     * already installed and launchable) instead of leaving it, so the
+     * "left the queue" path above never ran and the dashboard showed
+     * DOWNLOADING at 100% forever. Every byte transferred with no error is
+     * a completed download. */
+    if ((t->state == TASK_STATE_RUNNING || t->state == TASK_STATE_REGISTERED) &&
+        t->length_total > 0 && t->transferred_total >= t->length_total) {
+        t->state = TASK_STATE_COMPLETED;
+        t->speed_bps = 0.0;
+        slot->cleanup_pending = true;
+        LOG_INFO("task #%d (bgft %d) completed (%llu bytes)", t->id,
+                 t->bgft_task_id, (unsigned long long)t->transferred_total);
+        notify_terminal(t);
+    }
 }
 
 static void* taskman_thread(void* arg)
@@ -189,6 +220,11 @@ static void* taskman_thread(void* arg)
                 case TASK_STATE_RUNNING:
                 case TASK_STATE_PAUSED:
                     poll_task(&s_slots[i]);
+                    break;
+                case TASK_STATE_COMPLETED:
+                    if (s_slots[i].cleanup_pending) {
+                        poll_task(&s_slots[i]);
+                    }
                     break;
                 default:
                     break;
