@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Palette: own neutrals on a PS4-adjacent blue-black, one teal accent,
  * three status hues. All text/surface pairs pass WCAG AA (>= 4.5:1). */
@@ -830,9 +831,103 @@ void ui_fini(void)
     font_fini();
 }
 
+/*
+ * Screensaver (OLED burn-in protection). After UI_SAVER_IDLE_SEC without a
+ * pad press the dashboard is replaced by a black screen with one small,
+ * dim status block that jumps to a new random spot every UI_SAVER_MOVE_SEC,
+ * so no pixel stays lit in one place. Downloads keep running underneath.
+ * Timed with the wall clock: the toolchain's monotonic clock runs slow on
+ * firmware 14.0.
+ */
+#define UI_SAVER_IDLE_SEC  180
+#define UI_SAVER_MOVE_SEC  20
+#define UI_SAVER_MARGIN    64
+
+static time_t s_last_input = 0;
+static bool s_saver = false;
+static time_t s_saver_moved = 0;
+static int s_saver_x = 0;
+static int s_saver_y = 0;
+
+bool ui_note_input(void)
+{
+    bool was_saver = s_saver;
+
+    s_last_input = time(NULL);
+    s_saver = false;
+    return was_saver;
+}
+
+static void draw_saver(SDL_Renderer* r, time_t now)
+{
+    const struct ui_jobs* jobs = ui_snapshot();
+    char status[96];
+    char speed[32];
+    const char* title = "Remote PKG Installer";
+    const char* hint = "Press any button";
+    int active = 0;
+    uint64_t done = 0;
+    uint64_t total = 0;
+    double bps = 0.0;
+    int line_h = font_height(UI_SCALE) + 12;
+    int block_w;
+    int block_h = 2 * line_h + font_height(UI_SCALE_SM);
+    int i;
+
+    for (i = 0; i < jobs->count; ++i) {
+        const task_info_t* t = &jobs->items[i];
+        if (t->state == TASK_STATE_RUNNING || t->state == TASK_STATE_REGISTERED) {
+            ++active;
+            done += t->transferred_total;
+            total += t->length_total;
+            bps += t->speed_bps;
+        }
+    }
+    if (active > 0) {
+        format_speed(bps, speed, sizeof(speed));
+        snprintf(status, sizeof(status), "%d downloading  %d%%  %s", active,
+                 total ? (int)(done * 100u / total) : 0, speed);
+    } else {
+        snprintf(status, sizeof(status), "No active downloads");
+    }
+
+    block_w = (int)strlen(status) * font_advance(UI_SCALE);
+    if ((int)strlen(title) * font_advance(UI_SCALE) > block_w) {
+        block_w = (int)strlen(title) * font_advance(UI_SCALE);
+    }
+    if (s_saver_moved == 0 || now - s_saver_moved >= UI_SAVER_MOVE_SEC) {
+        int span_x = UI_W - 2 * UI_SAVER_MARGIN - block_w;
+        int span_y = UI_H - 2 * UI_SAVER_MARGIN - block_h;
+        s_saver_x = UI_SAVER_MARGIN + (span_x > 0 ? rand() % span_x : 0);
+        s_saver_y = UI_SAVER_MARGIN + (span_y > 0 ? rand() % span_y : 0);
+        s_saver_moved = now;
+    }
+
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 0xFF);
+    SDL_RenderClear(r);
+    font_draw(r, s_saver_x, s_saver_y, UI_SCALE, 0x1F5F58u, title);
+    font_draw(r, s_saver_x, s_saver_y + line_h, UI_SCALE, 0x55606Eu, status);
+    font_draw(r, s_saver_x, s_saver_y + 2 * line_h, UI_SCALE_SM, 0x333A44u, hint);
+    SDL_RenderPresent(r);
+}
+
 void ui_frame(SDL_Renderer* r)
 {
     char hud[64];
+    time_t now = time(NULL);
+
+    if (s_last_input == 0) {
+        s_last_input = now;
+        srand((unsigned)now);
+    }
+    if (!s_saver && now - s_last_input >= UI_SAVER_IDLE_SEC) {
+        s_saver = true;
+        s_saver_moved = 0;
+    }
+    if (s_saver) {
+        draw_saver(r, now);
+        return;
+    }
 
     ++s_frame_seq;
     s_icon_budget = 1; /* at most one icon decode per frame */

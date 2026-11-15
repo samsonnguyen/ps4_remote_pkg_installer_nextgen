@@ -267,6 +267,15 @@ static void handle_pad_frame(void)
     uint32_t pressed = pad_poll();
     size_t i;
 
+    if (pressed == 0) {
+        return;
+    }
+    /* Any press wakes the screensaver, and only wakes it: a press meant
+     * to dismiss a black screen must not pause, stop or exit anything. */
+    if (s_ui_ok && ui_note_input()) {
+        return;
+    }
+
     if (pressed & ORBIS_PAD_BUTTON_OPTIONS) {
         request_exit(); /* OPTIONS exits (asks again during downloads) */
         return;
