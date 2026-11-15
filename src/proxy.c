@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define PROXY_MAX_JOBS     32
 #define PROXY_URL_MAX      2048  /* must hold long signed piece URLs */
@@ -57,6 +58,11 @@ struct proxy_stream {
     uint64_t pos;
     bool failed;
     bool aborted;
+    /* Every open stream is on s_streams so shutdown can abort all of them,
+     * including ones the job registry does not reference. */
+    struct proxy_stream* next;
+    struct proxy_stream* prev;
+    bool linked;
 };
 
 struct proxy_job {
@@ -82,6 +88,40 @@ struct proxy_job {
 
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct proxy_job s_jobs[PROXY_MAX_JOBS];
+static struct proxy_stream* s_streams = NULL;   /* open streams (s_lock) */
+static int s_stream_count = 0;
+
+/* Caller must hold s_lock. */
+static void stream_link(struct proxy_stream* st)
+{
+    st->prev = NULL;
+    st->next = s_streams;
+    if (s_streams) {
+        s_streams->prev = st;
+    }
+    s_streams = st;
+    st->linked = true;
+    ++s_stream_count;
+}
+
+/* Caller must hold s_lock. */
+static void stream_unlink(struct proxy_stream* st)
+{
+    if (!st->linked) {
+        return;
+    }
+    if (st->prev) {
+        st->prev->next = st->next;
+    } else {
+        s_streams = st->next;
+    }
+    if (st->next) {
+        st->next->prev = st->prev;
+    }
+    st->next = st->prev = NULL;
+    st->linked = false;
+    --s_stream_count;
+}
 
 static struct proxy_job* find_job(int job_id)
 {
@@ -362,6 +402,7 @@ void* proxy_stream_open(int job_id, size_t piece, uint64_t offset,
     }
 
     pthread_mutex_lock(&s_lock);
+    stream_link(st);
     job = find_job(job_id);
     if (!job) {
         pthread_mutex_unlock(&s_lock);
@@ -441,6 +482,7 @@ void proxy_stream_close(int job_id, void* stream)
     /* Drop the registry's reference first (under the lock) so nothing can
      * abort or double-free the stream we are about to free. */
     pthread_mutex_lock(&s_lock);
+    stream_unlink(st);
     job = find_job(job_id);
     if (job && job->stream == st) {
         job->stream = NULL;
@@ -452,7 +494,7 @@ void proxy_stream_close(int job_id, void* stream)
              * produced went to this request's client in order. */
             job->engine_busy = false;
             job->engine_pos = st->offset + st->pos;
-            if (st->failed) {
+            if (st->failed || __atomic_load_n(&st->aborted, __ATOMIC_ACQUIRE)) {
                 job->engine = NULL;
                 to_free = st->pf;
             }
@@ -471,4 +513,65 @@ void proxy_stream_close(int job_id, void* stream)
         http_stream_close(st->hs);
     }
     free(st);
+}
+
+void proxy_abort_all(void)
+{
+    prefetch_t* idle[PROXY_MAX_JOBS];
+    int idle_count = 0;
+    int aborted = 0;
+    struct proxy_stream* st;
+    int i;
+
+    pthread_mutex_lock(&s_lock);
+    for (st = s_streams; st; st = st->next) {
+        stream_abort(st);
+        ++aborted;
+    }
+    for (i = 0; i < PROXY_MAX_JOBS; ++i) {
+        struct proxy_job* job = &s_jobs[i];
+        if (!job->used || !job->engine) {
+            continue;
+        }
+        if (job->engine_busy) {
+            /* Lent out: its stream was aborted above and frees it. */
+            continue;
+        }
+        idle[idle_count++] = job->engine;
+        job->engine = NULL;
+    }
+    pthread_mutex_unlock(&s_lock);
+
+    for (i = 0; i < idle_count; ++i) {
+        engine_free_async(idle[i]);
+    }
+    if (aborted || idle_count) {
+        LOG_INFO("proxy: aborted %d stream(s), released %d idle engine(s)",
+                 aborted, idle_count);
+    }
+}
+
+bool proxy_wait_idle(int timeout_ms)
+{
+    int waited = 0;
+
+    for (;;) {
+        int streams;
+        int engines;
+
+        pthread_mutex_lock(&s_lock);
+        streams = s_stream_count;
+        pthread_mutex_unlock(&s_lock);
+        engines = prefetch_live_count();
+        if (streams == 0 && engines == 0) {
+            return true;
+        }
+        if (waited >= timeout_ms) {
+            LOG_WARN("proxy: still busy after %d ms (%d stream(s), %d engine(s))",
+                     waited, streams, engines);
+            return false;
+        }
+        usleep(50 * 1000);
+        waited += 50;
+    }
 }

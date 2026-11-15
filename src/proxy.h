@@ -50,6 +50,15 @@ void* proxy_stream_open(int job_id, size_t piece, uint64_t offset,
  * busy) or "direct" (origin without Range). A static string. */
 const char* proxy_stream_mode(const void* stream);
 
+/* Aborts every open stream and releases idle read-ahead engines, so the
+ * connection threads serving them unwind at once (server shutdown, network
+ * loss). Registrations stay; new requests can still open streams. */
+void proxy_abort_all(void);
+
+/* Waits until no stream is open and every prefetch engine has been freed
+ * (its workers joined), up to timeout_ms. Returns false on timeout. */
+bool proxy_wait_idle(int timeout_ms);
+
 /* Reads the next block of the stream (0 at EOF, -1 on error). */
 int64_t proxy_stream_read(void* stream, uint8_t* buf, size_t len);
 

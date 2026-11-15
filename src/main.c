@@ -38,6 +38,7 @@
 #include <setjmp.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 #include <unistd.h>
 
 size_t sceLibcHeapSize = 256 * 1024 * 1024;
@@ -66,6 +67,48 @@ static bool s_init_done = false;
 /* No local input and no drawing after a recovered fault: the thread state
  * that produced it is not trusted, so the app runs as a background service. */
 static bool s_safe_mode = false;
+
+/* Set at shutdown once every proxy transfer has been torn down. */
+static bool s_modules_safe_to_unload = true;
+
+/* OPTIONS while a download is being served asks for a second press:
+ * BGFT fetches proxied pieces from this app, so exiting stops them. */
+#define EXIT_CONFIRM_WINDOW_S 3.0
+static double s_exit_armed_at = -1.0;
+
+static double now_seconds(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static bool count_active_job(const task_info_t* info, void* arg)
+{
+    int* count = (int*)arg;
+    if (info->state == TASK_STATE_REGISTERED || info->state == TASK_STATE_RUNNING ||
+        info->state == TASK_STATE_PAUSED || info->state == TASK_STATE_PREPARING ||
+        info->state == TASK_STATE_PENDING) {
+        ++*count;
+    }
+    return true;
+}
+
+static void request_exit(void)
+{
+    int active = 0;
+    double now = now_seconds();
+
+    taskman_foreach(count_active_job, &active);
+    if (active == 0 ||
+        (s_exit_armed_at >= 0.0 && now - s_exit_armed_at <= EXIT_CONFIRM_WINDOW_S)) {
+        s_running = false;
+        return;
+    }
+    s_exit_armed_at = now;
+    LOG_WARN("%d download(s) in progress will stop if the app closes. "
+             "Press OPTIONS again within 3 s to exit.", active);
+}
 
 static void on_netmon_event(void* arg, bool up)
 {
@@ -125,7 +168,7 @@ static void handle_pad_frame(void)
     size_t i;
 
     if (pressed & ORBIS_PAD_BUTTON_OPTIONS) {
-        s_running = false; /* OPTIONS exits */
+        request_exit(); /* OPTIONS exits (asks again during downloads) */
         return;
     }
 
@@ -363,6 +406,11 @@ int main(void)
      * tears the subsystem down entirely: freeing them afterwards (as the
      * old order did) is a use-after-free at exit. */
     server_stop();
+    /* Prefetch workers run inside libSceHttp/libSceNet: unloading those
+     * modules (below) while a worker is still mid-request crashes the app
+     * at exit. Wait for every engine to be joined; if one is still stuck,
+     * leave the modules loaded and let process exit reclaim everything. */
+    s_modules_safe_to_unload = proxy_wait_idle(8000);
     if (s_ui_ok) {
         ui_fini();
     }
@@ -381,7 +429,11 @@ int main(void)
     if (s_user_service_owned) {
         sceUserServiceTerminate();
     }
-    modules_unload();
+    if (s_modules_safe_to_unload) {
+        modules_unload();
+    } else {
+        LOG_WARN("exit: transfers still unwinding; leaving modules loaded");
+    }
 
     dbglogger_stop();
 

@@ -56,6 +56,10 @@ void prefetch_abort(prefetch_t* pf);
 /* Joins workers and frees resources. */
 void prefetch_free(prefetch_t* pf);
 
+/* Engines started by prefetch_start and not yet finished by prefetch_free
+ * (their workers may still be inside the HTTP library). */
+int prefetch_live_count(void);
+
 /* Snapshots current stats. */
 void prefetch_stats(const prefetch_t* pf, prefetch_stats_t* out);
 

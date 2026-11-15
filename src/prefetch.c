@@ -73,6 +73,12 @@ struct worker_ctx {
  * engine usable instead of failing outright. */
 static pthread_mutex_t s_ring_lock = PTHREAD_MUTEX_INITIALIZER;
 static size_t s_ring_bytes = 0;
+static int s_live_engines = 0;   /* started and not yet fully freed */
+
+int prefetch_live_count(void)
+{
+    return __atomic_load_n(&s_live_engines, __ATOMIC_ACQUIRE);
+}
 
 static size_t ring_size_for(uint64_t total_size)
 {
@@ -344,6 +350,7 @@ prefetch_t* prefetch_start(const char* url, uint64_t base, uint64_t total_size,
         }
     }
     pf->threads_spawned = true;
+    __atomic_add_fetch(&s_live_engines, 1, __ATOMIC_RELEASE);
     return pf;
 
 err:
@@ -464,6 +471,8 @@ void prefetch_free(prefetch_t* pf)
     }
     free(pf->chunk_state);
     free(pf);
+    /* Last: workers are joined and nothing of the engine remains. */
+    __atomic_sub_fetch(&s_live_engines, 1, __ATOMIC_RELEASE);
 }
 
 void prefetch_stats(const prefetch_t* pf, prefetch_stats_t* out)

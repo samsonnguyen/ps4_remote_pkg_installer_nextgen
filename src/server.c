@@ -1641,6 +1641,11 @@ void server_stop(void)
     }
     pthread_join(thread, NULL);
 
+    /* Connections serving BGFT block inside proxy reads for as long as the
+     * download runs; abort their streams so they unwind now instead of
+     * outliving the wait below (and the modules they are running in). */
+    proxy_abort_all();
+
     /* Wait briefly (bounded) for in-flight connection threads. They are
      * detached, so stragglers (e.g. a send stuck on a dead link) finish on
      * their own; blocking here forever would stall the netmon thread and
