@@ -26,6 +26,7 @@
 #include <cJSON.h>
 
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -222,29 +223,160 @@ static void serve_static_file(OrbisNetId fd, const char* name)
     fclose(f);
 }
 
-/* GET /static/proxy/<job>/<piece>: streams a piece through the
- * adaptive prefetch engine (transfer acceleration). */
-static void serve_proxy_piece(OrbisNetId fd, int job_id, size_t piece)
-{
-    uint64_t total = 0;
-    void* stream;
-    char head[256];
-    uint8_t* buf;
-    int64_t n;
+/* Boot-journal notes for proxy traffic, capped so a long download cannot
+ * grow the journal without bound. */
+#define PROXY_DIAG_MAX 64
+static int s_proxy_diag_count = 0;
 
-    stream = proxy_stream_open(job_id, piece, &total);
-    if (!stream) {
+static void proxy_diag(const char* fmt, ...)
+{
+    char note[128];
+    va_list ap;
+
+    if (__atomic_fetch_add(&s_proxy_diag_count, 1, __ATOMIC_RELAXED) >= PROXY_DIAG_MAX) {
+        return;
+    }
+    va_start(ap, fmt);
+    vsnprintf(note, sizeof(note), fmt, ap);
+    va_end(ap);
+    diag_note(note);
+}
+
+/*
+ * Parses a single-range "bytes=a-b", "bytes=a-" or "bytes=-n" header
+ * against a resource of `size` bytes. Returns 1 with [*start, *start+*len)
+ * for a satisfiable range, 0 when the header is absent or not a single
+ * byte range (serve the whole resource), -1 when it is unsatisfiable.
+ */
+static int parse_range(const char* range, uint64_t size, uint64_t* start,
+                       uint64_t* len)
+{
+    const char* p;
+    char* end;
+    unsigned long long a;
+    unsigned long long b;
+
+    if (!range || !range[0] || strncasecmp(range, "bytes=", 6) != 0 ||
+        strchr(range, ',')) {
+        return 0;
+    }
+    p = range + 6;
+    if (*p == '-') {
+        /* Suffix range: the last n bytes. */
+        a = strtoull(p + 1, &end, 10);
+        if (end == p + 1 || a == 0) {
+            return -1;
+        }
+        if (a > size) {
+            a = size;
+        }
+        *start = size - a;
+        *len = a;
+        return 1;
+    }
+    a = strtoull(p, &end, 10);
+    if (end == p || *end != '-') {
+        return 0;
+    }
+    p = end + 1;
+    if (*p == '\0') {
+        b = size ? size - 1 : 0;
+    } else {
+        b = strtoull(p, &end, 10);
+        if (end == p) {
+            return 0;
+        }
+        if (b >= size) {
+            b = size - 1;
+        }
+    }
+    if (a >= size || b < a) {
+        return -1;
+    }
+    *start = a;
+    *len = b - a + 1;
+    return 1;
+}
+
+/* GET/HEAD /static/proxy/<job>/<piece>: streams a piece (or the byte range
+ * the client asked for) through the adaptive prefetch engine. */
+static void serve_proxy_piece(OrbisNetId fd, const char* method, int job_id,
+                              size_t piece, const char* range)
+{
+    uint64_t size = 0;
+    uint64_t start = 0;
+    uint64_t len = 0;
+    uint64_t sent = 0;
+    bool is_head = strcmp(method, "HEAD") == 0;
+    void* stream;
+    char head[384];
+    uint8_t* buf;
+    int64_t n = 0;
+    int ranged;
+
+    if (!proxy_piece_size(job_id, piece, &size) || size == 0) {
+        proxy_diag("proxy-%s-%d/%zu-unknown", method, job_id, piece);
         resp_error(fd, 404, "Not found", "Piece not found");
         return;
     }
 
-    snprintf(head, sizeof(head),
-             "HTTP/1.1 200 OK\r\n"
-             "Connection: close\r\n"
-             "Content-Type: application/octet-stream\r\n"
-             "Content-Length: %llu\r\n"
-             "\r\n",
-             (unsigned long long)total);
+    ranged = parse_range(range, size, &start, &len);
+    if (ranged < 0) {
+        proxy_diag("proxy-%s-%d/%zu-416-%.40s", method, job_id, piece, range);
+        snprintf(head, sizeof(head),
+                 "HTTP/1.1 416 Range Not Satisfiable\r\n"
+                 "Connection: close\r\n"
+                 "Content-Range: bytes */%llu\r\n"
+                 "Content-Length: 0\r\n"
+                 "\r\n",
+                 (unsigned long long)size);
+        conn_send_str(fd, head);
+        return;
+    }
+    if (ranged == 0) {
+        start = 0;
+        len = size;
+    }
+    proxy_diag("proxy-%s-%d/%zu-at-%llu-len-%llu-of-%llu", method, job_id, piece,
+               (unsigned long long)start, (unsigned long long)len,
+               (unsigned long long)size);
+
+    if (ranged > 0) {
+        snprintf(head, sizeof(head),
+                 "HTTP/1.1 206 Partial Content\r\n"
+                 "Connection: close\r\n"
+                 "Accept-Ranges: bytes\r\n"
+                 "Content-Type: application/octet-stream\r\n"
+                 "Content-Range: bytes %llu-%llu/%llu\r\n"
+                 "Content-Length: %llu\r\n"
+                 "\r\n",
+                 (unsigned long long)start,
+                 (unsigned long long)(start + len - 1),
+                 (unsigned long long)size, (unsigned long long)len);
+    } else {
+        snprintf(head, sizeof(head),
+                 "HTTP/1.1 200 OK\r\n"
+                 "Connection: close\r\n"
+                 "Accept-Ranges: bytes\r\n"
+                 "Content-Type: application/octet-stream\r\n"
+                 "Content-Length: %llu\r\n"
+                 "\r\n",
+                 (unsigned long long)size);
+    }
+
+    if (is_head) {
+        /* Headers only: never start an origin download for a HEAD. */
+        conn_send_str(fd, head);
+        return;
+    }
+
+    stream = proxy_stream_open(job_id, piece, start, len);
+    if (!stream) {
+        proxy_diag("proxy-open-failed-%d/%zu-at-%llu", job_id, piece,
+                   (unsigned long long)start);
+        resp_error(fd, 503, "Service unavailable", "Piece stream unavailable");
+        return;
+    }
     conn_send_str(fd, head);
 
     buf = (uint8_t*)malloc(SERVER_SEND_CHUNK);
@@ -256,17 +388,22 @@ static void serve_proxy_piece(OrbisNetId fd, int job_id, size_t piece)
         if (!conn_send(fd, buf, (size_t)n)) {
             break; /* client is gone: stop pulling from the origin */
         }
+        sent += (uint64_t)n;
     }
     free(buf);
     proxy_stream_close(job_id, stream);
 
+    proxy_diag("proxy-end-%d/%zu-at-%llu-sent-%llu-of-%llu-ret-%lld", job_id,
+               piece, (unsigned long long)start, (unsigned long long)sent,
+               (unsigned long long)len, (long long)n);
     if (n < 0) {
         LOG_WARN("proxy: stream for job %d piece %zu failed mid-transfer",
                  job_id, piece);
     }
 }
 
-static void handle_static(OrbisNetId fd, const char* path)
+static void handle_static(OrbisNetId fd, const char* method, const char* path,
+                          const char* range)
 {
     /* path starts with "/static/" */
     const char* name = path + 8;
@@ -280,7 +417,7 @@ static void handle_static(OrbisNetId fd, const char* path)
             resp_error(fd, 400, "Bad request", "Invalid path");
             return;
         }
-        serve_proxy_piece(fd, job_id, (size_t)piece);
+        serve_proxy_piece(fd, method, job_id, (size_t)piece, range);
         return;
     }
 
@@ -981,7 +1118,7 @@ static void handle_v2_install(OrbisNetId fd, const char* body, size_t body_len)
 /* Request routing */
 
 static void route(OrbisNetId fd, const char* method, const char* path,
-                  const char* body, size_t body_len)
+                  const char* range, const char* body, size_t body_len)
 {
     /* Browser-based frontends send a preflight before JSON POST requests. */
     if (strcmp(method, "OPTIONS") == 0) {
@@ -1000,7 +1137,7 @@ static void route(OrbisNetId fd, const char* method, const char* path,
             return;
         }
         if (util_starts_with(path, "/static/")) {
-            handle_static(fd, path);
+            handle_static(fd, method, path, range);
             return;
         }
         if (strcmp(path, "/api/v2/system") == 0) {
@@ -1305,13 +1442,10 @@ static void* conn_thread(void* arg)
             LOG_INFO("http: %s %s%s%s range=%s", req.method, req.path,
                      req.query[0] ? "?" : "", req.query,
                      req.range[0] ? req.range : "-");
-            if (req.query[0]) {
-                char note[96];
-                snprintf(note, sizeof(note), "http-static-query-%.60s", req.query);
-                diag_note(note);
-            }
+            proxy_diag("http-%s-%.40s-range-%.40s", req.method, req.path + 8,
+                       req.range[0] ? req.range : "none");
         }
-        route(fd, req.method, req.path, req.body, req.body_len);
+        route(fd, req.method, req.path, req.range, req.body, req.body_len);
         free(req.body);
     } else {
         resp_error(fd, 400, "Bad request", "Malformed request");

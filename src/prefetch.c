@@ -38,7 +38,8 @@ enum chunk_state {
 
 struct prefetch {
     char url[2048];
-    uint64_t total_size;
+    uint64_t base;               /* origin offset of stream byte 0 */
+    uint64_t total_size;         /* stream length from base */
     int connections;
 
     uint8_t* ring;
@@ -221,7 +222,9 @@ static void* worker_run(prefetch_t* pf)
             want = PREFETCH_CHUNK_SIZE;
         }
 
-        if (!http_client_get_session(&sess, pf->url, off, want, buf, want, &r) ||
+        /* off is relative to the stream; the origin is asked at base + off,
+         * while the ring keeps using the relative offset. */
+        if (!http_client_get_session(&sess, pf->url, pf->base + off, want, buf, want, &r) ||
             !HTTP_IS_OK(r.status) || !r.partial || r.body_len != want) {
             pthread_mutex_lock(&pf->lock);
             if (pf->chunk_state[c] == CHUNK_CLAIMED) {
@@ -282,7 +285,8 @@ static void* worker_run(prefetch_t* pf)
     }
 }
 
-prefetch_t* prefetch_start(const char* url, uint64_t total_size, int connections)
+prefetch_t* prefetch_start(const char* url, uint64_t base, uint64_t total_size,
+                           int connections)
 {
     prefetch_t* pf;
 
@@ -302,6 +306,7 @@ prefetch_t* prefetch_start(const char* url, uint64_t total_size, int connections
     }
 
     snprintf(pf->url, sizeof(pf->url), "%s", url);
+    pf->base = base;
     pf->total_size = total_size;
     pf->connections = connections;
     pf->ring_size = ring_size_for(total_size);

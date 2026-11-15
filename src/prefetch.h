@@ -35,11 +35,14 @@ typedef struct prefetch_stats {
 } prefetch_stats_t;
 
 /*
- * Starts prefetching `url` (total_size bytes known by the caller).
- * connections == 1 performs a plain single-stream download.
+ * Starts prefetching `total_size` bytes of `url` beginning at byte `base`
+ * (so a client's Range request can be served from the middle of a piece).
+ * Reads return bytes from `base` onward; offsets inside the stream are
+ * relative to it. connections == 1 performs a plain single-stream download.
  * Returns NULL on failure (allocation/thread error).
  */
-prefetch_t* prefetch_start(const char* url, uint64_t total_size, int connections);
+prefetch_t* prefetch_start(const char* url, uint64_t base, uint64_t total_size,
+                           int connections);
 
 /*
  * Reads up to len bytes sequentially (blocking until data is available).

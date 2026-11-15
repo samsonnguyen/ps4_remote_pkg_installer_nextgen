@@ -168,7 +168,25 @@ void proxy_unregister(int job_id)
     pthread_mutex_unlock(&s_lock);
 }
 
-void* proxy_stream_open(int job_id, size_t piece, uint64_t* total_size)
+bool proxy_piece_size(int job_id, size_t piece, uint64_t* size)
+{
+    struct proxy_job* job;
+    bool ok = false;
+
+    pthread_mutex_lock(&s_lock);
+    job = find_job(job_id);
+    if (job && piece < job->count) {
+        if (size) {
+            *size = job->pieces[piece].size;
+        }
+        ok = true;
+    }
+    pthread_mutex_unlock(&s_lock);
+    return ok;
+}
+
+void* proxy_stream_open(int job_id, size_t piece, uint64_t offset,
+                        uint64_t length)
 {
     char url[PROXY_URL_MAX];
     uint64_t size = 0;
@@ -199,12 +217,22 @@ void* proxy_stream_open(int job_id, size_t piece, uint64_t* total_size)
     if (size == 0 || url[0] == '\0') {
         return NULL;
     }
+    if (length == 0 || offset >= size || length > size - offset) {
+        return NULL;
+    }
+    if (offset > 0 && !ranges_ok) {
+        /* The sequential fallback always starts at byte 0. */
+        LOG_WARN("proxy: job %d piece %zu: range at %llu needs an origin "
+                 "that supports Range", job_id, piece,
+                 (unsigned long long)offset);
+        return NULL;
+    }
 
     st = (struct proxy_stream*)calloc(1, sizeof(*st));
     if (!st) {
         return NULL;
     }
-    st->size = size;
+    st->size = length;
 
     /* The prefetch engine only works against servers that honour Range
      * requests (every worker fetch is a range GET). No-Range origins go
@@ -214,10 +242,14 @@ void* proxy_stream_open(int job_id, size_t piece, uint64_t* total_size)
     if (ranges_ok) {
         int conns = PROXY_CONN_SMALL;
 
-        if (size >= PROXY_BIG_PIECE) {
+        /* A Range request means BGFT is already splitting the piece over
+         * its own parallel connections: adding our workers on top of each
+         * one multiplied threads and ring buffers until the heap broke.
+         * Only a whole-piece request gets the parallel engine. */
+        if (offset == 0 && length == size && length >= PROXY_BIG_PIECE) {
             conns = PROXY_CONN_BIG;
         }
-        st->pf = prefetch_start(url, size, conns);
+        st->pf = prefetch_start(url, offset, length, conns);
     }
     st->direct = (st->pf == NULL);
     if (st->direct) {
@@ -244,9 +276,6 @@ void* proxy_stream_open(int job_id, size_t piece, uint64_t* total_size)
      * proxy_stream_close. */
     pthread_mutex_unlock(&s_lock);
 
-    if (total_size) {
-        *total_size = size;
-    }
     return st;
 }
 

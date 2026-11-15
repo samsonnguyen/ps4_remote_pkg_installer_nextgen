@@ -35,7 +35,15 @@ void proxy_unregister(int job_id);
  * size + Range support. Only one piece streams per job at a time (BGFT
  * reads sequentially); opening a new piece aborts the previous one.
  */
-void* proxy_stream_open(int job_id, size_t piece, uint64_t* total_size);
+/* Size of a registered piece, without opening anything (HEAD, Range checks).
+ * Returns false when the job or piece is unknown. */
+bool proxy_piece_size(int job_id, size_t piece, uint64_t* size);
+
+/* Opens a stream over bytes [offset, offset + length) of a piece. Pass
+ * offset 0 and the full size for a whole-piece request. A piece whose
+ * origin ignores Range can only be streamed from offset 0. */
+void* proxy_stream_open(int job_id, size_t piece, uint64_t offset,
+                        uint64_t length);
 
 /* Reads the next block of the stream (0 at EOF, -1 on error). */
 int64_t proxy_stream_read(void* stream, uint8_t* buf, size_t len);
