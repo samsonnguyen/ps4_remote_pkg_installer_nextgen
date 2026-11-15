@@ -215,10 +215,16 @@ struct worker_ctx {
 static pthread_mutex_t s_ring_lock = PTHREAD_MUTEX_INITIALIZER;
 static size_t s_ring_bytes = 0;
 static int s_live_engines = 0;   /* started and not yet fully freed */
+static int s_live_multi = 0;     /* ... of which run more than one worker */
 
 int prefetch_live_count(void)
 {
     return __atomic_load_n(&s_live_engines, __ATOMIC_ACQUIRE);
+}
+
+int prefetch_live_multi_count(void)
+{
+    return __atomic_load_n(&s_live_multi, __ATOMIC_ACQUIRE);
 }
 
 static size_t ring_size_for(uint64_t total_size)
@@ -478,9 +484,23 @@ prefetch_t* prefetch_start(const char* url, uint64_t base, uint64_t total_size,
     /* Init the sync primitives BEFORE any allocation that can fail: the
      * err path below locks/broadcasts/joins through them, so they must
      * be valid on every path that reaches it. */
-    pthread_mutex_init(&pf->lock, NULL);
-    pthread_cond_init(&pf->data_avail, NULL);
-    pthread_cond_init(&pf->work_avail, NULL);
+    {
+        /* pthread objects come from libkernel, which allocates them; a
+         * failed init left an unusable lock that would fault later inside
+         * libkernel. Refuse to start instead, and say why. */
+        int rm = pthread_mutex_init(&pf->lock, NULL);
+        int rc1 = pthread_cond_init(&pf->data_avail, NULL);
+        int rc2 = pthread_cond_init(&pf->work_avail, NULL);
+        if (rm != 0 || rc1 != 0 || rc2 != 0) {
+            diag_notef("probe-pthread-init-mutex-%d-cond-%d-%d", rm, rc1, rc2);
+            LOG_ERROR("prefetch: lock init failed (%d/%d/%d)", rm, rc1, rc2);
+            if (rm == 0) pthread_mutex_destroy(&pf->lock);
+            if (rc1 == 0) pthread_cond_destroy(&pf->data_avail);
+            if (rc2 == 0) pthread_cond_destroy(&pf->work_avail);
+            free(pf);
+            return NULL;
+        }
+    }
 
     pf->ring = (uint8_t*)malloc(pf->ring_size + PF_CANARY_LEN);
     if (pf->ring) {
@@ -525,6 +545,9 @@ prefetch_t* prefetch_start(const char* url, uint64_t base, uint64_t total_size,
     }
     pf->threads_spawned = true;
     __atomic_add_fetch(&s_live_engines, 1, __ATOMIC_RELEASE);
+    if (pf->connections > 1) {
+        __atomic_add_fetch(&s_live_multi, 1, __ATOMIC_RELEASE);
+    }
     return pf;
 
 err:
@@ -651,10 +674,16 @@ void prefetch_free(prefetch_t* pf)
         ring_budget_sub(pf->ring_size);
         free(pf->ring);
     }
-    free(pf->chunk_state);
-    free(pf);
-    /* Last: workers are joined and nothing of the engine remains. */
-    __atomic_sub_fetch(&s_live_engines, 1, __ATOMIC_RELEASE);
+    {
+        bool multi = pf->connections > 1;
+        free(pf->chunk_state);
+        free(pf);
+        /* Last: workers are joined and nothing of the engine remains. */
+        if (multi) {
+            __atomic_sub_fetch(&s_live_multi, 1, __ATOMIC_RELEASE);
+        }
+        __atomic_sub_fetch(&s_live_engines, 1, __ATOMIC_RELEASE);
+    }
 }
 
 void prefetch_stats(const prefetch_t* pf, prefetch_stats_t* out)

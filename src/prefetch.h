@@ -60,6 +60,9 @@ void prefetch_free(prefetch_t* pf);
  * (their workers may still be inside the HTTP library). */
 int prefetch_live_count(void);
 
+/* Live engines running more than one worker (connection). */
+int prefetch_live_multi_count(void);
+
 /* Snapshots current stats. */
 void prefetch_stats(const prefetch_t* pf, prefetch_stats_t* out);
 
