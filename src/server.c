@@ -1607,7 +1607,7 @@ bool server_start(int port)
     s_port = port;
     s_running = true;
 
-    if (pthread_create(&s_thread, NULL, accept_thread, NULL) != 0) {
+    if (util_thread_start(&s_thread, accept_thread, NULL, false) != 0) {
         LOG_ERROR("server: pthread_create failed");
         s_running = false;
         s_listen_fd = -1;

@@ -53,3 +53,13 @@ void util_format_size(uint64_t bytes, char* out, size_t outsz);
 
 /* True if s starts with prefix. */
 bool util_starts_with(const char* s, const char* prefix);
+
+/* Stack for every app thread. The console's default pthread stack is small
+ * and undocumented; a thread that overflows it cannot run the fault
+ * handler (the handler runs on that same stack), so the app dies silently
+ * with CE-34878-0 and no crash journal entry. */
+#define UTIL_THREAD_STACK (512u * 1024u)
+
+/* pthread_create with an explicit UTIL_THREAD_STACK stack, optionally
+ * detached. Returns pthread_create's result (0 on success). */
+int util_thread_start(void* tid, void* (*fn)(void*), void* arg, bool detached);
