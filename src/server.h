@@ -28,4 +28,7 @@ void server_stop(void);
 
 bool server_is_running(void);
 
+/* Connection threads currently serving a request (diagnostics). */
+int server_active_conns(void);
+
 int server_port(void);

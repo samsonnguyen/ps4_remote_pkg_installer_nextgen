@@ -154,6 +154,16 @@ int prefetch_live_multi_count(void)
     return __atomic_load_n(&s_live_multi, __ATOMIC_ACQUIRE);
 }
 
+size_t prefetch_ring_bytes(void)
+{
+    size_t bytes;
+
+    pthread_mutex_lock(&s_ring_lock);
+    bytes = s_ring_bytes;
+    pthread_mutex_unlock(&s_ring_lock);
+    return bytes;
+}
+
 static size_t ring_size_for(uint64_t total_size)
 {
     size_t avail;

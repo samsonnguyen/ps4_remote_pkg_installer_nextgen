@@ -20,6 +20,7 @@
 #include "netmon.h"
 #include "notify.h"
 #include "pad.h"
+#include "prefetch.h"
 #include "proxy.h"
 #include "server.h"
 #include "storage.h"
@@ -27,6 +28,7 @@
 #include "ui.h"
 #include "util.h"
 
+#include <orbis/libkernel.h>
 #include <orbis/Pad.h>
 #include <orbis/Sysmodule.h>
 #include <orbis/SystemService.h>
@@ -71,6 +73,76 @@ static bool s_safe_mode = false;
 
 /* Set at shutdown once every proxy transfer has been torn down. */
 static bool s_modules_safe_to_unload = true;
+
+/*
+ * Heartbeat: every HEARTBEAT_SEC the main loop journals memory and
+ * transfer state to /data/rpi_nextgen_beat.txt. A process the system kills
+ * outright (CE error code, no fault handler) leaves no crash entry, so this
+ * timeline is the only record of what led up to it.
+ */
+#define HEARTBEAT_SEC 5
+
+struct beat_jobs {
+    char* out;
+    size_t cap;
+    size_t len;
+};
+
+static bool beat_job(const task_info_t* info, void* arg)
+{
+    struct beat_jobs* b = (struct beat_jobs*)arg;
+    int n;
+
+    if (b->len >= b->cap) {
+        return false;
+    }
+    n = snprintf(b->out + b->len, b->cap - b->len,
+                 " | j%d st=%d %lluM/%lluM err=%x",
+                 info->id, (int)info->state,
+                 (unsigned long long)(info->transferred_total >> 20),
+                 (unsigned long long)(info->length_total >> 20),
+                 (unsigned)info->error);
+    if (n > 0) {
+        b->len += (size_t)n;
+        if (b->len > b->cap) {
+            b->len = b->cap;
+        }
+    }
+    return true;
+}
+
+static void heartbeat_tick(void)
+{
+    static time_t s_last = 0;
+    time_t now = time(NULL);
+    size_t flex = 0;
+    char line[512];
+    struct beat_jobs jobs;
+    int n;
+
+    if (s_last != 0 && now - s_last < HEARTBEAT_SEC) {
+        return;
+    }
+    s_last = now;
+
+    if (sceKernelAvailableFlexibleMemorySize(&flex) != 0) {
+        flex = 0;
+    }
+    n = snprintf(line, sizeof(line),
+                 "up=%.0fs flex=%zuK eng=%d/%d ring=%zuK streams=%d conns=%d step=%s",
+                 diag_uptime(), flex >> 10, prefetch_live_count(),
+                 prefetch_live_multi_count(), prefetch_ring_bytes() >> 10,
+                 proxy_live_streams(), server_active_conns(), diag_step());
+    if (n < 0) {
+        return;
+    }
+    jobs.out = line;
+    jobs.cap = sizeof(line) - 1;
+    jobs.len = ((size_t)n < jobs.cap) ? (size_t)n : jobs.cap;
+    taskman_foreach(beat_job, &jobs);
+    line[sizeof(line) - 1] = '\0';
+    diag_beat(line);
+}
 
 /*
  * Ends the app the way the system expects. Returning from main (or exit()/
@@ -410,6 +482,7 @@ int main(void)
 
     diag_note("run");
     while (s_running) {
+        heartbeat_tick();
         if (!s_safe_mode) {
             handle_pad_frame();
         }

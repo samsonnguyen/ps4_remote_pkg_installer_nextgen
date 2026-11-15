@@ -63,6 +63,9 @@ int prefetch_live_count(void);
 /* Live engines running more than one worker (connection). */
 int prefetch_live_multi_count(void);
 
+/* Bytes currently allocated to read-ahead rings, across all engines. */
+size_t prefetch_ring_bytes(void);
+
 /* Snapshots current stats. */
 void prefetch_stats(const prefetch_t* pf, prefetch_stats_t* out);
 
