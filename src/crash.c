@@ -57,7 +57,7 @@
  * app's call chain even when the fault itself is inside a system library. */
 #define CRASH_APP_TEXT_LO 0x400000ULL
 #define CRASH_APP_TEXT_HI 0x500000ULL
-#define CRASH_STACK_SCAN_WORDS 512   /* 4 KiB above the faulting rsp */
+#define CRASH_STACK_SCAN_WORDS 128   /* 1 KiB above the faulting rsp */
 #define CRASH_MAX_FRAMES 12
 
 #define CRASH_MAIN_STRIKE_LIMIT 3
@@ -161,25 +161,45 @@ static void crash_handler(int sig, void* uc)
      * fault during the scan loses nothing already recorded). */
     if (uc && fault_rip && s_journal_fd >= 0) {
         uint64_t rsp = crash_read_u64(uc, CRASH_MC_OFF + CRASH_MC_RSP);
+
+        /* Registers at the fault (FreeBSD amd64 mcontext order). rdi/rsi/rdx
+         * are the first arguments of the function that faulted. */
+        len = snprintf(line, sizeof(line),
+                       "  rdi=%llx rsi=%llx rdx=%llx rbx=%llx rbp=%llx rsp=%llx\n",
+                       (unsigned long long)crash_read_u64(uc, CRASH_MC_OFF + 8),
+                       (unsigned long long)crash_read_u64(uc, CRASH_MC_OFF + 16),
+                       (unsigned long long)crash_read_u64(uc, CRASH_MC_OFF + 24),
+                       (unsigned long long)crash_read_u64(uc, CRASH_MC_OFF + 64),
+                       (unsigned long long)crash_read_u64(uc, CRASH_MC_OFF + 72),
+                       (unsigned long long)rsp);
+        if (len > 0) write(s_journal_fd, line, (size_t)len);
+        len = snprintf(line, sizeof(line),
+                       "  r12=%llx r13=%llx r14=%llx r15=%llx rax=%llx\n",
+                       (unsigned long long)crash_read_u64(uc, CRASH_MC_OFF + 96),
+                       (unsigned long long)crash_read_u64(uc, CRASH_MC_OFF + 104),
+                       (unsigned long long)crash_read_u64(uc, CRASH_MC_OFF + 112),
+                       (unsigned long long)crash_read_u64(uc, CRASH_MC_OFF + 120),
+                       (unsigned long long)crash_read_u64(uc, CRASH_MC_OFF + 56));
+        if (len > 0) write(s_journal_fd, line, (size_t)len);
+
         if (rsp >= 0x10000ULL && (rsp & 7) == 0) {
             const uint64_t* sp = (const uint64_t*)(uintptr_t)rsp;
             int found = 0;
             int i;
-            len = snprintf(line, sizeof(line), "  rsp=0x%llx app-frames:",
-                           (unsigned long long)rsp);
+            /* Each frame is written as soon as it is found: if the scan
+             * runs off the top of the stack (a fault right at thread start
+             * or exit), the frames before that point are still recorded. */
+            write(s_journal_fd, "  app-frames:", 13);
             for (i = 0; i < CRASH_STACK_SCAN_WORDS && found < CRASH_MAX_FRAMES; ++i) {
                 uint64_t v = sp[i];
-                if (v >= CRASH_APP_TEXT_LO && v < CRASH_APP_TEXT_HI &&
-                    len > 0 && (size_t)len < sizeof(line) - 12) {
-                    len += snprintf(line + len, sizeof(line) - (size_t)len,
-                                    " %llx", (unsigned long long)(v - CRASH_APP_TEXT_LO));
+                if (v >= CRASH_APP_TEXT_LO && v < CRASH_APP_TEXT_HI) {
+                    len = snprintf(line, sizeof(line), " %llx@%d",
+                                   (unsigned long long)(v - CRASH_APP_TEXT_LO), i);
+                    if (len > 0) write(s_journal_fd, line, (size_t)len);
                     ++found;
                 }
             }
-            if (len > 0 && (size_t)len < sizeof(line) - 1) {
-                line[len++] = '\n';
-                write(s_journal_fd, line, (size_t)len);
-            }
+            write(s_journal_fd, " end\n", 5);
         }
     }
 
