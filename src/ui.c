@@ -144,6 +144,10 @@ static const char* error_hint(int error)
     switch ((uint32_t)error) {
         case 0x80990088u: /* SCE_BGFT_ERROR_SAME_APPLICATION_ALREADY_INSTALLED (bgft.h) */
             return "Already installed";
+        case 0x80990015u: /* SCE_BGFT_ERROR_TASK_DUPLICATED (bgft.h) */
+            return "Already in PS4 Downloads";
+        case 0x80990086u: /* SCE_BGFT_ERROR_CONTENT_ALREADY_DOWNLOADING (bgft.h) */
+            return "Already downloading";
         case 0x80010002u: /* ENXIO: BGFT not initialized / no foreground user (bgft.c) */
             return "Transfer service unavailable";
         case 0x80010016u: /* EINVAL: action not valid for this transfer state */

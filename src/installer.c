@@ -390,6 +390,9 @@ static bool install_pieces(const char* const* urls, size_t url_count, bool is_re
     snprintf(content_url, sizeof(content_url), "http://%s:%d/static/%s.json",
              ip, INSTALLER_PORT, tmp_name);
 
+    taskman_set_identity(job_id, hdr.content_id, title, hdr.package_size,
+                         pkg_is_patch(hdr.content_flags));
+
     if (!bgft_register(hdr.content_id, content_url, title,
                        has_icon ? icon_url_path : NULL, package_type, NULL,
                        hdr.package_size, pkg_is_patch(hdr.content_flags),

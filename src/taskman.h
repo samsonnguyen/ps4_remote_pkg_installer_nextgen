@@ -87,6 +87,10 @@ void taskman_foreach(taskman_visit_t cb, void* arg);
 
 /* State transitions used by the installer and the API layer. */
 bool taskman_set_state(int id, task_state_t state, int error);
+/* Records what a job is installing before BGFT registration, so a job that
+ * fails to register still reports its content id and title. */
+bool taskman_set_identity(int id, const char* content_id, const char* title,
+                          uint64_t package_size, bool is_patch);
 bool taskman_set_registered(int id, int bgft_task_id, const char* content_id,
                             const char* title, uint64_t package_size,
                             bool is_patch, bool has_icon,

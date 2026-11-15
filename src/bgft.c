@@ -135,6 +135,119 @@ int bgft_get_user_id(void)
     return user_id;
 }
 
+static bool is_duplicate_error(int ret)
+{
+    return ret == (int)SCE_BGFT_ERROR_TASK_DUPLICATED ||
+           ret == (int)SCE_BGFT_ERROR_CONTENT_ALREADY_DOWNLOADING;
+}
+
+/*
+ * Registration was refused because BGFT already holds a task for this
+ * content id. Find that task, record what state it is in (diag journal and
+ * activity log), and release it when it has already failed so the caller can
+ * register once more. A task that has not failed is left alone: it may be a
+ * download the user still wants, and they can cancel it from the PS4
+ * Downloads list.
+ *
+ * Returns true only when a failed task was unregistered and a retry makes
+ * sense. *existing_task_id receives the task found, or -1.
+ */
+static bool bgft_release_failed_duplicate(const char* content_id,
+                                          const char* package_type,
+                                          bool is_patch, int* existing_task_id)
+{
+    int candidates[3];
+    int count = 0;
+    int i;
+    int found = SCE_BGFT_INVALID_TASK_ID;
+    int found_sub_type = 0;
+    char note[128];
+
+    *existing_task_id = SCE_BGFT_INVALID_TASK_ID;
+
+    /* Most likely sub type first, then the other game sub types. */
+    if (is_patch) {
+        candidates[count++] = SCE_BGFT_TASK_SUB_TYPE_GAME_PATCH;
+    } else if (package_type && strcmp(package_type, "PS4AC") == 0) {
+        candidates[count++] = SCE_BGFT_TASK_SUB_TYPE_GAME_AC;
+    } else {
+        candidates[count++] = SCE_BGFT_TASK_SUB_TYPE_GAME;
+    }
+    if (candidates[0] != SCE_BGFT_TASK_SUB_TYPE_GAME)
+        candidates[count++] = SCE_BGFT_TASK_SUB_TYPE_GAME;
+    if (candidates[0] != SCE_BGFT_TASK_SUB_TYPE_GAME_AC)
+        candidates[count++] = SCE_BGFT_TASK_SUB_TYPE_GAME_AC;
+    if (count < 3 && candidates[0] != SCE_BGFT_TASK_SUB_TYPE_GAME_PATCH)
+        candidates[count++] = SCE_BGFT_TASK_SUB_TYPE_GAME_PATCH;
+
+    for (i = 0; i < count; ++i) {
+        int id = SCE_BGFT_INVALID_TASK_ID;
+        int find_error = 0;
+        if (bgft_find_task(content_id, candidates[i], &id, &find_error) && id >= 0) {
+            found = id;
+            found_sub_type = candidates[i];
+            break;
+        }
+    }
+
+    if (found < 0) {
+        diag_note("serviceint-dup-not-found");
+        LOG_ERROR("bgft: %s is already registered but no matching task was found; "
+                  "cancel it in Notifications > Downloads, or restart the PS4",
+                  content_id);
+        return false;
+    }
+
+    *existing_task_id = found;
+    {
+        SceBgftTaskProgress progress;
+        int progress_error = 0;
+        bool have_progress = bgft_get_progress(found, &progress, &progress_error);
+
+        if (have_progress) {
+            snprintf(note, sizeof(note),
+                     "serviceint-dup-task-%d-sub-%d-bits-%08X-err-%08X-xfer-%lu-of-%lu",
+                     found, found_sub_type, (unsigned)progress.bits,
+                     (unsigned)progress.errorResult,
+                     (unsigned long)progress.transferredTotal,
+                     (unsigned long)progress.lengthTotal);
+        } else {
+            snprintf(note, sizeof(note),
+                     "serviceint-dup-task-%d-sub-%d-progress-ret-%08X",
+                     found, found_sub_type, (unsigned)progress_error);
+        }
+        diag_note(note);
+
+        if (have_progress && progress.errorResult == 0) {
+            LOG_ERROR("bgft: %s already has download task %d (%lu/%lu bytes, "
+                      "bits 0x%08X); finish or cancel it in Notifications > "
+                      "Downloads, then retry",
+                      content_id, found,
+                      (unsigned long)progress.transferredTotal,
+                      (unsigned long)progress.lengthTotal,
+                      (unsigned)progress.bits);
+            return false;
+        }
+
+        LOG_WARN("bgft: releasing failed task %d for %s (error 0x%08X)",
+                 found, content_id,
+                 have_progress ? (unsigned)progress.errorResult
+                               : (unsigned)progress_error);
+    }
+
+    {
+        int unregister_error = 0;
+        if (!bgft_unregister_task(found, &unregister_error)) {
+            LOG_ERROR("bgft: could not release task %d: 0x%08X; cancel it in "
+                      "Notifications > Downloads, then retry",
+                      found, (unsigned)unregister_error);
+            return false;
+        }
+    }
+    diag_note("serviceint-dup-released");
+    return true;
+}
+
 bool bgft_register(const char* content_id, const char* content_url,
                    const char* content_name, const char* icon_path,
                    const char* package_type, const char* package_sub_type,
@@ -144,6 +257,7 @@ bool bgft_register(const char* content_id, const char* content_url,
     SceBgftDownloadParam params;
     SceBgftTaskId task_id = SCE_BGFT_INVALID_TASK_ID;
     int ret;
+    int attempt;
 
     if (!s_initialized) {
         ret = 0x80010002; /* ENXIO-ish */
@@ -171,20 +285,32 @@ bool bgft_register(const char* content_id, const char* content_url,
     params.packageSubType = package_sub_type ? package_sub_type : "";
     params.packageSize = (unsigned long)package_size;
 
-    diag_note(is_patch ? "serviceint-register-patch" : "serviceint-register-base");
-    if (!is_patch) {
-        ret = sceBgftServiceIntDownloadRegisterTask(&params, &task_id);
-    } else {
-        ret = sceBgftServiceIntDebugDownloadRegisterPkg(&params, &task_id);
-    }
-    bgft_diag_ret("register", ret);
-    if (ret != 0) {
+    /* At most one retry, and only after a failed duplicate was released. */
+    for (attempt = 0; attempt < 2; ++attempt) {
+        int existing = SCE_BGFT_INVALID_TASK_ID;
+
+        task_id = SCE_BGFT_INVALID_TASK_ID;
+        diag_note(is_patch ? "serviceint-register-patch" : "serviceint-register-base");
+        if (!is_patch) {
+            ret = sceBgftServiceIntDownloadRegisterTask(&params, &task_id);
+        } else {
+            ret = sceBgftServiceIntDebugDownloadRegisterPkg(&params, &task_id);
+        }
+        bgft_diag_ret("register", ret);
+        if (ret == 0) {
+            break;
+        }
         if (ret == (int)SCE_BGFT_ERROR_SAME_APPLICATION_ALREADY_INSTALLED) {
             /* Legacy behaviour: report success with task id -1. */
             task_id = -1;
             goto done;
         }
         LOG_ERROR("bgft register failed: 0x%08X", ret);
+        if (attempt == 0 && is_duplicate_error(ret) &&
+            bgft_release_failed_duplicate(content_id, package_type, is_patch,
+                                          &existing)) {
+            continue;
+        }
         goto err;
     }
 

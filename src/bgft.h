@@ -27,6 +27,12 @@ extern "C" {
 #endif
 
 #define SCE_BGFT_ERROR_SAME_APPLICATION_ALREADY_INSTALLED (0x80990088)
+/* A task for this content id is already registered with BGFT (for example a
+ * failed or stopped entry left in Notifications > Downloads). Name as used by
+ * other PS4 installers; observed on firmware 14.0 when a stale task exists. */
+#define SCE_BGFT_ERROR_TASK_DUPLICATED (0x80990015)
+/* The same content id is currently downloading. */
+#define SCE_BGFT_ERROR_CONTENT_ALREADY_DOWNLOADING (0x80990086)
 #define SCE_BGFT_INVALID_TASK_ID (-1)
 #define SCE_BGFT_HEAP_SIZE (1 * 1024 * 1024)
 

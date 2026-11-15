@@ -399,6 +399,29 @@ bool taskman_set_state(int id, task_state_t state, int error)
     return ok;
 }
 
+bool taskman_set_identity(int id, const char* content_id, const char* title,
+                          uint64_t package_size, bool is_patch)
+{
+    struct taskman_slot* slot;
+    bool ok = false;
+
+    pthread_mutex_lock(&s_lock);
+    slot = find_slot(id);
+    if (slot) {
+        if (content_id) {
+            snprintf(slot->info.content_id, sizeof(slot->info.content_id), "%s", content_id);
+        }
+        if (title) {
+            snprintf(slot->info.title, sizeof(slot->info.title), "%s", title);
+        }
+        slot->info.package_size = package_size;
+        slot->info.is_patch = is_patch;
+        ok = true;
+    }
+    pthread_mutex_unlock(&s_lock);
+    return ok;
+}
+
 bool taskman_set_registered(int id, int bgft_task_id, const char* content_id,
                             const char* title, uint64_t package_size,
                             bool is_patch, bool has_icon,
