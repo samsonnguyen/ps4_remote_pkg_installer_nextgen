@@ -50,6 +50,15 @@
 #define CRASH_MC_LEN   200
 #define CRASH_MC_ADDR  136
 #define CRASH_MC_RIP   160
+#define CRASH_MC_RSP   184
+
+/* The app's code (the ELF is loaded at 0x400000; its text is < 1 MiB).
+ * Return addresses in this range on a faulting thread's stack name the
+ * app's call chain even when the fault itself is inside a system library. */
+#define CRASH_APP_TEXT_LO 0x400000ULL
+#define CRASH_APP_TEXT_HI 0x500000ULL
+#define CRASH_STACK_SCAN_WORDS 512   /* 4 KiB above the faulting rsp */
+#define CRASH_MAX_FRAMES 12
 
 #define CRASH_MAIN_STRIKE_LIMIT 3
 
@@ -145,6 +154,33 @@ static void crash_handler(int sig, void* uc)
     sceKernelDebugOutText(0, line);
     if (s_journal_fd >= 0 && len > 0) {
         write(s_journal_fd, line, (size_t)len);
+    }
+
+    /* Second line: candidate return addresses into the app, found by
+     * scanning the faulting stack (written after the fault line, so a
+     * fault during the scan loses nothing already recorded). */
+    if (uc && fault_rip && s_journal_fd >= 0) {
+        uint64_t rsp = crash_read_u64(uc, CRASH_MC_OFF + CRASH_MC_RSP);
+        if (rsp >= 0x10000ULL && (rsp & 7) == 0) {
+            const uint64_t* sp = (const uint64_t*)(uintptr_t)rsp;
+            int found = 0;
+            int i;
+            len = snprintf(line, sizeof(line), "  rsp=0x%llx app-frames:",
+                           (unsigned long long)rsp);
+            for (i = 0; i < CRASH_STACK_SCAN_WORDS && found < CRASH_MAX_FRAMES; ++i) {
+                uint64_t v = sp[i];
+                if (v >= CRASH_APP_TEXT_LO && v < CRASH_APP_TEXT_HI &&
+                    len > 0 && (size_t)len < sizeof(line) - 12) {
+                    len += snprintf(line + len, sizeof(line) - (size_t)len,
+                                    " %llx", (unsigned long long)(v - CRASH_APP_TEXT_LO));
+                    ++found;
+                }
+            }
+            if (len > 0 && (size_t)len < sizeof(line) - 1) {
+                line[len++] = '\n';
+                write(s_journal_fd, line, (size_t)len);
+            }
+        }
     }
 
     if (!is_main) {

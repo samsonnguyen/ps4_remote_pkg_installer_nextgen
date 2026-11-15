@@ -12,6 +12,7 @@
 #include "modules.h"
 #include "diag.h"
 
+#include <pthread.h>
 #include <stdio.h>
 
 #include <orbis/UserService.h>
@@ -100,6 +101,15 @@ bool bgft_init(void)
     }
 
     s_initialized = true;
+
+    /* Where the system libraries landed, so a crash journal rip such as
+     * 0x800004414 can be attributed to a module (and a nearby export). */
+    diag_notef("probe-addr-kernel-mutex_lock-%p-join-%p",
+               (void*)pthread_mutex_lock, (void*)pthread_join);
+    diag_notef("probe-addr-bgft-register-%p-registerpkg-%p-progress-%p",
+               (void*)sceBgftServiceIntDownloadRegisterTask,
+               (void*)sceBgftServiceIntDebugDownloadRegisterPkg,
+               (void*)sceBgftServiceDownloadGetProgress);
     return true;
 }
 
