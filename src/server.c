@@ -1513,8 +1513,15 @@ static void* accept_thread(void* arg)
         pthread_mutex_unlock(&s_lock);
 
         if (spawn) {
-            if (pthread_create(&tid, NULL, conn_thread,
-                               (void*)(intptr_t)fd) == 0) {
+            /* Connection threads serve proxy streams (and log from deep
+             * call chains): give them an explicit stack, not the default. */
+            pthread_attr_t attr;
+            int rc;
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, 512u * 1024u);
+            rc = pthread_create(&tid, &attr, conn_thread, (void*)(intptr_t)fd);
+            pthread_attr_destroy(&attr);
+            if (rc == 0) {
                 pthread_detach(tid);
             } else {
                 sceNetSocketClose(fd);

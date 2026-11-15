@@ -20,7 +20,12 @@
 
 #define PROXY_BIG_PIECE    (8u * 1024u * 1024u)   /* switch to parallel above */
 #define PROXY_CONN_SMALL   1
-#define PROXY_CONN_BIG     PREFETCH_DEFAULT_CONNECTIONS
+/* Origin connections for the read-ahead engine. Runs with several
+ * multi-worker engines alive corrupted memory on firmware 14.0 (crash
+ * journal: __bin_chunk, then a garbage stdout FILE in locking_putc);
+ * single-connection runs never did. Keep 1 until more workers are proven
+ * stable; the engine still reads ahead across BGFT's requests. */
+#define PROXY_ENGINE_CONNS 1
 
 /*
  * How BGFT reads a piece (journal, firmware 14.0): one 16 MiB Range request
@@ -156,6 +161,7 @@ static void engine_free_async(prefetch_t* pf)
     prefetch_abort(pf);
     if (pthread_attr_init(&attr) == 0) {
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_attr_setstacksize(&attr, 256u * 1024u);
         started = pthread_create(&tid, &attr, engine_free_thread, pf) == 0;
         pthread_attr_destroy(&attr);
     }
@@ -367,7 +373,7 @@ void* proxy_stream_open(int job_id, size_t piece, uint64_t offset,
         } else {
             /* The engine reads from `offset` to the end of the piece so the
              * next contiguous request finds it already running. */
-            int conns = (size - offset >= PROXY_BIG_PIECE) ? PROXY_CONN_BIG
+            int conns = (size - offset >= PROXY_BIG_PIECE) ? PROXY_ENGINE_CONNS
                                                            : PROXY_CONN_SMALL;
             prefetch_t* pf = prefetch_start(url, offset, size - offset, conns);
 

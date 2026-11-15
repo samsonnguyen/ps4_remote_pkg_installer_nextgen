@@ -28,6 +28,7 @@
 #define PREFETCH_RING_MIN     (4u * 1024u * 1024u)
 #define PREFETCH_CHUNK_SIZE   (2u * 1024u * 1024u)  /* per-request granularity */
 #define PREFETCH_MAX_CONNS    8
+#define PREFETCH_WORKER_STACK (512u * 1024u)
 
 enum chunk_state {
     CHUNK_PENDING = 0,
@@ -342,9 +343,21 @@ prefetch_t* prefetch_start(const char* url, uint64_t base, uint64_t total_size,
                 goto err;
             }
             ctx->pf = pf;
-            if (pthread_create(&pf->threads[i], NULL, worker_thread, ctx) != 0) {
-                free(ctx);
-                goto err;
+            {
+                /* Workers call deep into libSceHttp. Size the stack
+                 * explicitly instead of trusting the platform default:
+                 * memory corruption appeared only with several workers
+                 * alive at once, which a stack overrun would explain. */
+                pthread_attr_t attr;
+                int rc;
+                pthread_attr_init(&attr);
+                pthread_attr_setstacksize(&attr, PREFETCH_WORKER_STACK);
+                rc = pthread_create(&pf->threads[i], &attr, worker_thread, ctx);
+                pthread_attr_destroy(&attr);
+                if (rc != 0) {
+                    free(ctx);
+                    goto err;
+                }
             }
             ++pf->thread_count;
         }
