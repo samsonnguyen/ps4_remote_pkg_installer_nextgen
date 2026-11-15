@@ -212,7 +212,7 @@ bool taskman_start(void)
     memset(s_slots, 0, sizeof(s_slots));
     s_running = true;
 
-    ret = pthread_create(&s_thread, NULL, taskman_thread, NULL);
+    ret = util_thread_start(&s_thread, taskman_thread, NULL, false);
     if (ret != 0) {
         LOG_ERROR("pthread_create(taskman) failed: %d", ret);
         s_running = false;

@@ -13,6 +13,8 @@
 #include <orbis/Net.h>
 #include <orbis/_types/sysmodule.h>
 
+#include "util.h"
+
 #include <pthread.h>
 #include <unistd.h>
 #include <string.h>
@@ -162,7 +164,7 @@ bool netmon_start(void)
     memset(s_subs, 0, sizeof(s_subs));
     s_started = true;
 
-    ret = pthread_create(&s_thread, NULL, netmon_thread, NULL);
+    ret = util_thread_start(&s_thread, netmon_thread, NULL, false);
     if (ret != 0) {
         LOG_ERROR("pthread_create(netmon) failed: %d", ret);
         s_started = false;

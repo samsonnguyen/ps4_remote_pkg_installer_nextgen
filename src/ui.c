@@ -769,9 +769,7 @@ static void action_retry(void)
     ctx->is_ref = t->is_ref;
 
     LOG_INFO("ui: re-transferring '%s'", t->title[0] ? t->title : t->url);
-    if (pthread_create(&tid, NULL, retry_thread, ctx) == 0) {
-        pthread_detach(tid);
-    } else {
+    if (util_thread_start(&tid, retry_thread, ctx, true) != 0) {
         free(ctx);
         LOG_WARN("ui: unable to start re-transfer");
     }

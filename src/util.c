@@ -5,6 +5,7 @@
  */
 #include "util.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -59,4 +60,25 @@ bool util_starts_with(const char* s, const char* prefix)
     }
     plen = strlen(prefix);
     return strncmp(s, prefix, plen) == 0;
+}
+
+int util_thread_start(void* tid, void* (*fn)(void*), void* arg, bool detached)
+{
+    pthread_t local;
+    pthread_t* out = tid ? (pthread_t*)tid : &local;
+    pthread_attr_t attr;
+    int rc;
+
+    /* libkernel allocates the attr object: never use one whose init failed. */
+    rc = pthread_attr_init(&attr);
+    if (rc != 0) {
+        return rc;
+    }
+    pthread_attr_setstacksize(&attr, UTIL_THREAD_STACK);
+    if (detached) {
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    }
+    rc = pthread_create(out, &attr, fn, arg);
+    pthread_attr_destroy(&attr);
+    return rc;
 }
