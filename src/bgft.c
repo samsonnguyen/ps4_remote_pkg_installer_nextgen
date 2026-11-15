@@ -104,8 +104,20 @@ bool bgft_init(void)
 
     /* Where the system libraries landed, so a crash journal rip such as
      * 0x800004414 can be attributed to a module (and a nearby export). */
-    diag_notef("probe-addr-kernel-mutex_lock-%p-join-%p",
-               (void*)pthread_mutex_lock, (void*)pthread_join);
+    {
+        extern int* __error(void);
+        diag_notef("probe-addr-kernel-mutex_lock-%p-join-%p",
+                   (void*)pthread_mutex_lock, (void*)pthread_join);
+        diag_notef("probe-addr-kernel-create-%p-detach-%p-self-%p-error-%p",
+                   (void*)pthread_create, (void*)pthread_detach,
+                   (void*)pthread_self, (void*)__error);
+        diag_notef("probe-addr-kernel-condwait-%p-condbcast-%p-unlock-%p",
+                   (void*)pthread_cond_wait, (void*)pthread_cond_broadcast,
+                   (void*)pthread_mutex_unlock);
+        diag_notef("probe-addr-kernel-attrinit-%p-setstack-%p-mutexinit-%p",
+                   (void*)pthread_attr_init, (void*)pthread_attr_setstacksize,
+                   (void*)pthread_mutex_init);
+    }
     diag_notef("probe-addr-bgft-register-%p-registerpkg-%p-progress-%p",
                (void*)sceBgftServiceIntDownloadRegisterTask,
                (void*)sceBgftServiceIntDebugDownloadRegisterPkg,
